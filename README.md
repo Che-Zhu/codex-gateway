@@ -180,6 +180,36 @@ Notes:
 - this is a PoC deployment shape, not a hardened public service
 - after the container starts, use the same health/API/Web UI verification flow described above
 
+## GitHub Container Registry
+
+GitHub Actions can publish this image to GHCR after pushes to `main` and version tags such as `v0.2.0`.
+
+Published tags:
+
+- `ghcr.io/che-zhu/codex-gateway:main` for the latest `main` branch image
+- `ghcr.io/che-zhu/codex-gateway:sha-<commit>` for each published commit
+- `ghcr.io/che-zhu/codex-gateway:v0.2.0`, `0.2.0`, `0.2`, `0`, and `latest` when pushing a version tag
+
+Pull the current `main` image:
+
+```bash
+docker pull ghcr.io/che-zhu/codex-gateway:main
+```
+
+Run it the same way as the local image:
+
+```bash
+docker run --rm \
+  -p 3000:3000 \
+  -e HOST=0.0.0.0 \
+  -e PORT=3000 \
+  -e MAX_SESSIONS=8 \
+  -v "$HOME/.codex:/codex-home" \
+  ghcr.io/che-zhu/codex-gateway:main
+```
+
+If the package is private, authenticate to GHCR before pulling it.
+
 ## Current limitations
 
 - no authentication or rate limiting

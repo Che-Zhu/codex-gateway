@@ -181,6 +181,36 @@ docker run --rm \
 - 这是 PoC 部署方式，不是生产加固版本
 - 容器启动后，验证方法和本地运行时完全一样
 
+## GitHub Container Registry
+
+GitHub Actions 可以在推送到 `main` 以及版本 tag（例如 `v0.2.0`）后，把镜像发布到 GHCR。
+
+发布出来的 tag 规则：
+
+- `ghcr.io/che-zhu/codex-gateway:main` 表示当前 `main` 分支最新镜像
+- `ghcr.io/che-zhu/codex-gateway:sha-<commit>` 表示每次发布对应的提交镜像
+- 推送版本 tag 时，会额外发布 `v0.2.0`、`0.2.0`、`0.2`、`0` 和 `latest`
+
+拉取当前 `main` 镜像：
+
+```bash
+docker pull ghcr.io/che-zhu/codex-gateway:main
+```
+
+运行方式和本地构建镜像一致：
+
+```bash
+docker run --rm \
+  -p 3000:3000 \
+  -e HOST=0.0.0.0 \
+  -e PORT=3000 \
+  -e MAX_SESSIONS=8 \
+  -v "$HOME/.codex:/codex-home" \
+  ghcr.io/che-zhu/codex-gateway:main
+```
+
+如果包可见性是私有的，拉取前需要先登录 GHCR。
+
 ## 当前限制
 
 - 没有鉴权和限流
