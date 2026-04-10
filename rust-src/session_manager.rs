@@ -1,0 +1,269 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use tokio::sync::Mutex;
+use tokio::sync::broadcast::Receiver;
+use tracing::{error, info};
+use uuid::Uuid;
+
+use crate::bridge::{BridgeOptions, CodexAppServerBridge};
+use crate::config::AppConfig;
+use crate::error::AppError;
+use crate::models::{BridgeEvent, BridgeStateSnapshot, SessionInfo};
+
+#[derive(Clone)]
+pub struct SessionManager {
+    inner: Arc<SessionManagerInner>,
+}
+
+struct SessionManagerInner {
+    config: AppConfig,
+    started_at: Instant,
+    sessions: RwLock<HashMap<String, Arc<Session>>>,
+    create_lock: Mutex<()>,
+}
+
+struct Session {
+    id: String,
+    bridge: CodexAppServerBridge,
+    metadata: Arc<SessionMetadata>,
+}
+
+struct SessionMetadata {
+    created_at: DateTime<Utc>,
+    last_access_at: RwLock<DateTime<Utc>>,
+    expires_at: RwLock<DateTime<Utc>>,
+}
+
+impl SessionManager {
+    pub fn new(config: AppConfig) -> Self {
+        let manager = Self {
+            inner: Arc::new(SessionManagerInner {
+                config,
+                started_at: Instant::now(),
+                sessions: RwLock::new(HashMap::new()),
+                create_lock: Mutex::new(()),
+            }),
+        };
+
+        manager.spawn_sweeper();
+        manager
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        &self.inner.config
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.inner.started_at.elapsed().as_secs()
+    }
+
+    pub fn count(&self) -> usize {
+        self.inner.sessions.read().unwrap().len()
+    }
+
+    pub async fn create_session(
+        &self,
+        model: Option<String>,
+    ) -> Result<(String, SessionInfo, BridgeStateSnapshot), AppError> {
+        let _guard = self.inner.create_lock.lock().await;
+        self.sweep_expired_sessions().await;
+
+        if self.count() >= self.inner.config.max_sessions {
+            return Err(AppError::service_unavailable(format!(
+                "Maximum concurrent sessions reached ({})",
+                self.inner.config.max_sessions
+            )));
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let metadata = Arc::new(SessionMetadata::new(self.inner.config.session_ttl));
+        let bridge = CodexAppServerBridge::new(BridgeOptions {
+            cwd: self.inner.config.bridge_cwd.clone(),
+            codex_bin: self.inner.config.codex_bin.clone(),
+            debug: self.inner.config.debug,
+            client_info: self.inner.config.client_info.clone(),
+            default_model: self.inner.config.default_model.clone(),
+            activity_touch: metadata.touch_callback(self.inner.config.session_ttl),
+        });
+
+        bridge.start().await?;
+        if let Some(model) = model {
+            let current_model = bridge.get_state().selected_model;
+            if current_model.as_deref() != Some(model.as_str()) {
+                bridge.start_new_thread(Some(model)).await?;
+            }
+        }
+
+        let session = Arc::new(Session {
+            id: id.clone(),
+            bridge,
+            metadata,
+        });
+        let info = session.info();
+        let state = session.bridge.get_state();
+
+        self.inner
+            .sessions
+            .write()
+            .unwrap()
+            .insert(id.clone(), session);
+        info!("session created {}", id);
+
+        Ok((id, info, state))
+    }
+
+    pub fn get_state(&self, session_id: &str) -> Result<BridgeStateSnapshot, AppError> {
+        let session = self.require_session(session_id)?;
+        Ok(session.bridge.get_state())
+    }
+
+    pub fn get_session_info(&self, session_id: &str) -> Result<SessionInfo, AppError> {
+        let session = self.require_session(session_id)?;
+        Ok(session.info())
+    }
+
+    pub fn subscribe(
+        &self,
+        session_id: &str,
+    ) -> Result<(SessionInfo, BridgeStateSnapshot, Receiver<BridgeEvent>), AppError> {
+        let session = self.require_session(session_id)?;
+        Ok((
+            session.info(),
+            session.bridge.get_state(),
+            session.bridge.subscribe(),
+        ))
+    }
+
+    pub async fn send_prompt(
+        &self,
+        session_id: &str,
+        prompt: &str,
+    ) -> Result<BridgeStateSnapshot, AppError> {
+        let session = self.require_session(session_id)?;
+        session.bridge.send_prompt(prompt).await?;
+        Ok(session.bridge.get_state())
+    }
+
+    pub async fn start_new_thread(
+        &self,
+        session_id: &str,
+        model: Option<String>,
+    ) -> Result<BridgeStateSnapshot, AppError> {
+        let session = self.require_session(session_id)?;
+        session.bridge.start_new_thread(model).await?;
+        Ok(session.bridge.get_state())
+    }
+
+    pub async fn close_session(&self, session_id: &str, reason: &str) -> Result<bool, AppError> {
+        let session = self.inner.sessions.write().unwrap().remove(session_id);
+        let Some(session) = session else {
+            return Ok(false);
+        };
+
+        session.bridge.broadcast_session_closed(session_id, reason);
+        session.bridge.stop().await?;
+        info!("session closed {} ({reason})", session_id);
+        Ok(true)
+    }
+
+    pub async fn shutdown(&self) -> Result<(), AppError> {
+        let ids = self
+            .inner
+            .sessions
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for id in ids {
+            let _ = self.close_session(&id, "shutdown").await;
+        }
+
+        Ok(())
+    }
+
+    async fn sweep_expired_sessions(&self) {
+        let now = Utc::now();
+        let expired_ids = self
+            .inner
+            .sessions
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, session)| {
+                if *session.metadata.expires_at.read().unwrap() <= now {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for id in expired_ids {
+            if let Err(error) = self.close_session(&id, "expired").await {
+                error!("failed to close expired session {id}: {error}");
+            }
+        }
+    }
+
+    fn require_session(&self, session_id: &str) -> Result<Arc<Session>, AppError> {
+        let session = self
+            .inner
+            .sessions
+            .read()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("Unknown session: {session_id}")))?;
+        session.metadata.touch(self.inner.config.session_ttl);
+        Ok(session)
+    }
+
+    fn spawn_sweeper(&self) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(manager.inner.config.session_sweep_interval).await;
+                manager.sweep_expired_sessions().await;
+            }
+        });
+    }
+}
+
+impl Session {
+    fn info(&self) -> SessionInfo {
+        SessionInfo {
+            id: self.id.clone(),
+            created_at: self.metadata.created_at,
+            last_access_at: *self.metadata.last_access_at.read().unwrap(),
+            expires_at: *self.metadata.expires_at.read().unwrap(),
+        }
+    }
+}
+
+impl SessionMetadata {
+    fn new(ttl: Duration) -> Self {
+        let now = Utc::now();
+        Self {
+            created_at: now,
+            last_access_at: RwLock::new(now),
+            expires_at: RwLock::new(now + chrono::Duration::from_std(ttl).unwrap_or_default()),
+        }
+    }
+
+    fn touch(&self, ttl: Duration) {
+        let now = Utc::now();
+        *self.last_access_at.write().unwrap() = now;
+        *self.expires_at.write().unwrap() =
+            now + chrono::Duration::from_std(ttl).unwrap_or_default();
+    }
+
+    fn touch_callback(self: &Arc<Self>, ttl: Duration) -> Arc<dyn Fn() + Send + Sync> {
+        let metadata = Arc::clone(self);
+        Arc::new(move || metadata.touch(ttl))
+    }
+}
