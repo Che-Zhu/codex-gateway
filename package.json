@@ -2,11 +2,11 @@
   "name": "codex-gateway",
   "version": "0.2.0",
   "private": true,
-  "type": "module",
-  "description": "Minimal multi-session HTTP/SSE gateway for codex app-server.",
+  "description": "Minimal multi-session HTTP/SSE gateway for codex app-server, now implemented in Rust.",
   "scripts": {
-    "start": "node src/bootstrap.mjs",
-    "web": "node src/bootstrap.mjs",
-    "cli": "node src/cli.mjs"
+    "start": "cargo run --bin codex-gateway",
+    "web": "cargo run --bin codex-gateway",
+    "cli": "cargo run --bin codex-gateway-cli --",
+    "check": "cargo check"
   }
 }

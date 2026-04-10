@@ -6,8 +6,8 @@ This repository is a minimal multi-session gateway for verifying that `codex app
 
 The current shape is:
 
-1. external clients call a Node HTTP API
-2. the Node service creates one Codex bridge per session
+1. external clients call a Rust HTTP API
+2. the Rust service creates one Codex bridge per session
 3. each bridge spawns its own local `codex app-server` child process over `stdio`
 4. streamed notifications are forwarded back to that client over SSE
 
@@ -20,16 +20,16 @@ Official references used while building this:
 
 ## What is in here
 
-- `src/codex-app-server.mjs`: reusable bridge for `initialize`, `account/read`, `model/list`, `thread/start`, `turn/start`, and notification handling
-- `src/codex-runtime.mjs`: shared runtime helpers for API-key login and `openai_base_url` overrides
-- `src/bootstrap.mjs`: startup entrypoint that performs optional API-key login before launching the gateway
-- `src/session-manager.mjs`: multi-session lifecycle manager for bridges, TTL cleanup, and session-scoped event forwarding
-- `src/server.mjs`: local/public HTTP server with session APIs, SSE streams, health endpoints, and the demo UI
-- `src/cli.mjs`: one-shot CLI smoke test for a single bridge
+- `rust-src/main.rs`: Rust HTTP server with session APIs, SSE streams, health endpoints, and static file serving
+- `rust-src/bridge.rs`: reusable bridge for `initialize`, `account/read`, `model/list`, `thread/start`, `turn/start`, and notification handling
+- `rust-src/runtime.rs`: shared runtime helpers for API-key login and `openai_base_url` overrides
+- `rust-src/session_manager.rs`: multi-session lifecycle manager for bridges and TTL cleanup
+- `rust-src/cli.rs`: one-shot CLI smoke test for a single bridge
+- `src/*.mjs`: previous Node implementation retained temporarily as migration reference
 - `public/index.html`: minimal browser UI
 - `public/app.js`: browser behavior that creates its own API session and listens to its own SSE stream
 - `public/styles.css`: intentionally simple UI styling
-- `Dockerfile`: single-container runtime image that installs the Codex CLI on Linux
+- `Dockerfile`: multi-stage image that builds the Rust gateway and installs the Codex CLI on Linux
 
 ## Runtime model
 
@@ -83,13 +83,13 @@ Start the local server:
 ```bash
 OPENAI_API_KEY=sk-... \
 CODEX_OPENAI_BASE_URL=https://sub2api-xnldrpuk.usw-1.sealos.app \
-npm start
+cargo run --bin codex-gateway
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:3000
+http://127.0.0.1:1317
 ```
 
 The page creates a fresh session automatically, subscribes to its own SSE stream, and tears the session down on tab close when possible.
@@ -99,23 +99,23 @@ The page creates a fresh session automatically, subscribes to its own SSE stream
 Run the one-shot harness:
 
 ```bash
-npm run cli
+cargo run --bin codex-gateway-cli --
 ```
 
 Or with a custom prompt:
 
 ```bash
-npm run cli -- "Reply with exactly the single word ready."
+cargo run --bin codex-gateway-cli -- "Reply with exactly the single word ready."
 ```
 
 ## Verification
 
 If you want to verify the project manually, the shortest path is:
 
-1. Start the service with `npm start`.
-2. Check `http://127.0.0.1:3000/healthz`.
-3. Check `http://127.0.0.1:3000/readyz`.
-4. Open `http://127.0.0.1:3000` and wait for the page status to become `ready`.
+1. Start the service with `cargo run --bin codex-gateway`.
+2. Check `http://127.0.0.1:1317/healthz`.
+3. Check `http://127.0.0.1:1317/readyz`.
+4. Open `http://127.0.0.1:1317` and wait for the page status to become `ready`.
 5. Send `Reply with exactly the single word ready. Do not call tools.` from the page.
 6. Confirm that the transcript shows `ready`.
 
@@ -124,7 +124,7 @@ If you want to verify the API directly instead of the page:
 Create a session:
 
 ```bash
-curl -X POST http://127.0.0.1:3000/api/sessions \
+curl -X POST http://127.0.0.1:1317/api/sessions \
   -H 'Content-Type: application/json' \
   -d '{}'
 ```
@@ -132,7 +132,7 @@ curl -X POST http://127.0.0.1:3000/api/sessions \
 Send a turn:
 
 ```bash
-curl -X POST http://127.0.0.1:3000/api/sessions/<SESSION_ID>/turn \
+curl -X POST http://127.0.0.1:1317/api/sessions/<SESSION_ID>/turn \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Reply with exactly the single word ready. Do not call tools."}'
 ```
@@ -140,15 +140,15 @@ curl -X POST http://127.0.0.1:3000/api/sessions/<SESSION_ID>/turn \
 Read the latest state:
 
 ```bash
-curl http://127.0.0.1:3000/api/sessions/<SESSION_ID>/state
+curl http://127.0.0.1:1317/api/sessions/<SESSION_ID>/state
 ```
 
 If the transcript contains `ready`, the gateway, bridge, and `codex app-server` handshake are all working.
 
 ## Environment variables
 
-- `HOST`: bind address for the Node server. Defaults to `0.0.0.0`.
-- `PORT`: bind port. Defaults to `3000`.
+- `HOST`: bind address for the Rust server. Defaults to `0.0.0.0`.
+- `PORT`: bind port. Defaults to `1317`.
 - `CODEX_CWD`: working directory passed to `thread/start`. Defaults to the repository root.
 - `CODEX_BIN`: path to the `codex` executable if it is not on `PATH`.
 - `CODEX_MODEL`: preferred default model for new bridges.
@@ -162,7 +162,7 @@ If the transcript contains `ready`, the gateway, bridge, and `codex app-server` 
 
 ## Docker
 
-The container image installs the Codex CLI on Linux with `npm install -g @openai/codex`, which matches the official Codex CLI quickstart.
+The container image builds the Rust gateway binary, then installs the Codex CLI on Linux with `npm install -g @openai/codex`, which matches the official Codex CLI quickstart.
 
 Build the image:
 
@@ -174,11 +174,11 @@ Run it:
 
 ```bash
 docker run --rm \
-  -p 3000:3000 \
+  -p 1317:1317 \
   -e OPENAI_API_KEY=sk-... \
   -e CODEX_OPENAI_BASE_URL=https://sub2api-xnldrpuk.usw-1.sealos.app \
   -e HOST=0.0.0.0 \
-  -e PORT=3000 \
+  -e PORT=1317 \
   -e MAX_SESSIONS=8 \
   codex-gateway
 ```
@@ -212,11 +212,11 @@ Run it the same way as the local image:
 
 ```bash
 docker run --rm \
-  -p 3000:3000 \
+  -p 1317:1317 \
   -e OPENAI_API_KEY=sk-... \
   -e CODEX_OPENAI_BASE_URL=https://sub2api-xnldrpuk.usw-1.sealos.app \
   -e HOST=0.0.0.0 \
-  -e PORT=3000 \
+  -e PORT=1317 \
   -e MAX_SESSIONS=8 \
   ghcr.io/che-zhu/codex-gateway:main
 ```

@@ -2,14 +2,14 @@
 
 English version: [README.md](./README.md)
 
-这个仓库当前的定位，是一个最小化的多 session `Codex gateway`，用于验证 `codex app-server` 能不能通过 Node HTTP/SSE 服务对外暴露。
+这个仓库当前的定位，是一个最小化的多 session `Codex gateway`，用于验证 `codex app-server` 能不能通过 Rust HTTP/SSE 服务对外暴露。
 
 ## 当前形态
 
 整体链路是：
 
-1. 外部客户端调用 Node HTTP API
-2. Node 服务为每个 session 创建一个 Codex bridge
+1. 外部客户端调用 Rust HTTP API
+2. Rust 服务为每个 session 创建一个 Codex bridge
 3. 每个 bridge 启动一个自己的本地 `codex app-server` 子进程
 4. `codex app-server` 的通知通过 SSE 回推给对应 session 的客户端
 
@@ -22,16 +22,16 @@ English version: [README.md](./README.md)
 
 ## 目录说明
 
-- `src/codex-app-server.mjs`：协议桥接层，负责 `initialize`、`account/read`、`model/list`、`thread/start`、`turn/start` 和通知处理
-- `src/codex-runtime.mjs`：运行时辅助模块，负责 API key 登录和 `openai_base_url` 覆盖
-- `src/bootstrap.mjs`：统一启动入口，会在启动 gateway 前按需执行 API key 登录
-- `src/session-manager.mjs`：多 session 生命周期管理，包含 TTL 回收和 session 级事件转发
-- `src/server.mjs`：HTTP 服务本体，提供 session API、SSE、健康检查和 Web UI
-- `src/cli.mjs`：单次 CLI 冒烟验证
+- `rust-src/main.rs`：Rust HTTP 服务本体，提供 session API、SSE、健康检查和静态文件
+- `rust-src/bridge.rs`：协议桥接层，负责 `initialize`、`account/read`、`model/list`、`thread/start`、`turn/start` 和通知处理
+- `rust-src/runtime.rs`：运行时辅助模块，负责 API key 登录和 `openai_base_url` 覆盖
+- `rust-src/session_manager.rs`：多 session 生命周期管理，包含 TTL 回收
+- `rust-src/cli.rs`：单次 CLI 冒烟验证
+- `src/*.mjs`：上一版 Node 实现，暂时保留作为迁移参考
 - `public/index.html`：最小化 Web UI
 - `public/app.js`：浏览器端逻辑，会自动创建自己的 session 并订阅自己的 SSE
 - `public/styles.css`：样式
-- `Dockerfile`：Linux 容器运行镜像
+- `Dockerfile`：多阶段容器镜像，负责构建 Rust 二进制并安装 Codex CLI
 
 ## 运行模型
 
@@ -85,13 +85,13 @@ English version: [README.md](./README.md)
 ```bash
 OPENAI_API_KEY=sk-... \
 CODEX_OPENAI_BASE_URL=https://sub2api-xnldrpuk.usw-1.sealos.app \
-npm start
+cargo run --bin codex-gateway
 ```
 
 打开：
 
 ```text
-http://127.0.0.1:3000
+http://127.0.0.1:1317
 ```
 
 页面会自动创建一个新的 session，自动连接它自己的 SSE 流，并在标签页关闭时尽量删除这个 session。
@@ -99,23 +99,23 @@ http://127.0.0.1:3000
 ### CLI 冒烟
 
 ```bash
-npm run cli
+cargo run --bin codex-gateway-cli --
 ```
 
 或自定义 prompt：
 
 ```bash
-npm run cli -- "Reply with exactly the single word ready."
+cargo run --bin codex-gateway-cli -- "Reply with exactly the single word ready."
 ```
 
 ## 手动验证
 
 如果你要快速验证这个项目能不能跑，建议按这个顺序：
 
-1. 执行 `npm start`
-2. 访问 `http://127.0.0.1:3000/healthz`
-3. 访问 `http://127.0.0.1:3000/readyz`
-4. 打开 `http://127.0.0.1:3000`
+1. 执行 `cargo run --bin codex-gateway`
+2. 访问 `http://127.0.0.1:1317/healthz`
+3. 访问 `http://127.0.0.1:1317/readyz`
+4. 打开 `http://127.0.0.1:1317`
 5. 等页面里的 `Status` 变成 `ready`
 6. 发送 `Reply with exactly the single word ready. Do not call tools.`
 7. 确认 Transcript 里出现 `ready`
@@ -125,7 +125,7 @@ npm run cli -- "Reply with exactly the single word ready."
 创建 session：
 
 ```bash
-curl -X POST http://127.0.0.1:3000/api/sessions \
+curl -X POST http://127.0.0.1:1317/api/sessions \
   -H 'Content-Type: application/json' \
   -d '{}'
 ```
@@ -133,7 +133,7 @@ curl -X POST http://127.0.0.1:3000/api/sessions \
 发送 turn：
 
 ```bash
-curl -X POST http://127.0.0.1:3000/api/sessions/<SESSION_ID>/turn \
+curl -X POST http://127.0.0.1:1317/api/sessions/<SESSION_ID>/turn \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Reply with exactly the single word ready. Do not call tools."}'
 ```
@@ -141,15 +141,15 @@ curl -X POST http://127.0.0.1:3000/api/sessions/<SESSION_ID>/turn \
 查看状态：
 
 ```bash
-curl http://127.0.0.1:3000/api/sessions/<SESSION_ID>/state
+curl http://127.0.0.1:1317/api/sessions/<SESSION_ID>/state
 ```
 
 如果 transcript 里出现 `ready`，就说明 gateway、bridge 和 `codex app-server` 之间的链路已经跑通。
 
 ## 环境变量
 
-- `HOST`：Node 服务监听地址，默认 `0.0.0.0`
-- `PORT`：监听端口，默认 `3000`
+- `HOST`：Rust 服务监听地址，默认 `0.0.0.0`
+- `PORT`：监听端口，默认 `1317`
 - `CODEX_CWD`：传给 `thread/start` 的工作目录，默认仓库根目录
 - `CODEX_BIN`：`codex` 可执行文件路径，默认从 `PATH` 查找
 - `CODEX_MODEL`：新 bridge 默认模型
@@ -163,7 +163,7 @@ curl http://127.0.0.1:3000/api/sessions/<SESSION_ID>/state
 
 ## Docker
 
-容器镜像会通过 `npm install -g @openai/codex` 在 Linux 中安装 Codex CLI，这和官方 Quickstart 一致。
+容器镜像会先构建 Rust gateway 二进制，再通过 `npm install -g @openai/codex` 在 Linux 中安装 Codex CLI，这和官方 Quickstart 一致。
 
 构建镜像：
 
@@ -175,11 +175,11 @@ docker build -t codex-gateway .
 
 ```bash
 docker run --rm \
-  -p 3000:3000 \
+  -p 1317:1317 \
   -e OPENAI_API_KEY=sk-... \
   -e CODEX_OPENAI_BASE_URL=https://sub2api-xnldrpuk.usw-1.sealos.app \
   -e HOST=0.0.0.0 \
-  -e PORT=3000 \
+  -e PORT=1317 \
   -e MAX_SESSIONS=8 \
   codex-gateway
 ```
@@ -213,11 +213,11 @@ docker pull ghcr.io/che-zhu/codex-gateway:main
 
 ```bash
 docker run --rm \
-  -p 3000:3000 \
+  -p 1317:1317 \
   -e OPENAI_API_KEY=sk-... \
   -e CODEX_OPENAI_BASE_URL=https://sub2api-xnldrpuk.usw-1.sealos.app \
   -e HOST=0.0.0.0 \
-  -e PORT=3000 \
+  -e PORT=1317 \
   -e MAX_SESSIONS=8 \
   ghcr.io/che-zhu/codex-gateway:main
 ```

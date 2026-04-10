@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
 const host = process.env.HOST || "0.0.0.0";
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.PORT || 1317);
 const bridgeCwd = process.env.CODEX_CWD || rootDir;
 
 const sessionManager = new SessionManager({

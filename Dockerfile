@@ -1,10 +1,18 @@
+FROM rust:1-bookworm AS builder
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY rust-src ./rust-src
+
+RUN cargo build --release --bin codex-gateway --bin codex-gateway-cli
+
 FROM node:22-bookworm-slim
 
 ARG CODEX_VERSION=latest
 
-ENV NODE_ENV=production \
-    HOST=0.0.0.0 \
-    PORT=3000 \
+ENV HOST=0.0.0.0 \
+    PORT=1317 \
     CODEX_HOME=/codex-home \
     MAX_SESSIONS=8 \
     SESSION_TTL_MS=1800000 \
@@ -19,12 +27,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @openai/codex@${CODEX_VERSION} \
     && mkdir -p /codex-home \
-    && codex --version
+    && codex --version \
+    && apt-get clean
 
-COPY package.json README.md ./
 COPY public ./public
-COPY src ./src
+COPY --from=builder /build/target/release/codex-gateway /usr/local/bin/codex-gateway
+COPY --from=builder /build/target/release/codex-gateway-cli /usr/local/bin/codex-gateway-cli
 
-EXPOSE 3000
+EXPOSE 1317
 
-CMD ["node", "src/bootstrap.mjs"]
+CMD ["codex-gateway"]
