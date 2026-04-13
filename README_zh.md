@@ -201,18 +201,18 @@ docker run --rm \
 
 ## GitHub Container Registry
 
-GitHub Actions 可以在推送到 `main` 以及版本 tag（例如 `v0.2.0`）后，把镜像发布到 GHCR。
+GitHub Actions 可以在推送到 `main` 以及版本 tag（例如 `v0.3.0`）后，把镜像发布到 GHCR。
 
 发布出来的 tag 规则：
 
-- `ghcr.io/che-zhu/codex-gateway:main` 表示当前 `main` 分支最新镜像
-- `ghcr.io/che-zhu/codex-gateway:sha-<commit>` 表示每次发布对应的提交镜像
-- 推送版本 tag 时，会额外发布 `v0.2.0`、`0.2.0`、`0.2`、`0` 和 `latest`
+- `ghcr.io/labring/codex-gateway:main` 表示当前 `main` 分支最新镜像
+- `ghcr.io/labring/codex-gateway:sha-<commit>` 表示每次发布对应的提交镜像
+- 推送版本 tag 时，会额外发布 `v0.3.0`、`0.3.0`、`0.3`、`0` 和 `latest`
 
 拉取当前 `main` 镜像：
 
 ```bash
-docker pull ghcr.io/che-zhu/codex-gateway:main
+docker pull ghcr.io/labring/codex-gateway:main
 ```
 
 运行方式和本地构建镜像一致：
@@ -225,7 +225,7 @@ docker run --rm \
   -e CODEX_GATEWAY_HOST=0.0.0.0 \
   -e CODEX_GATEWAY_PORT=1317 \
   -e CODEX_GATEWAY_MAX_SESSIONS=8 \
-  ghcr.io/che-zhu/codex-gateway:main
+  ghcr.io/labring/codex-gateway:main
 ```
 
 如果包可见性是私有的，拉取前需要先登录 GHCR。

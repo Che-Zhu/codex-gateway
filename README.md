@@ -200,18 +200,18 @@ Notes:
 
 ## GitHub Container Registry
 
-GitHub Actions can publish this image to GHCR after pushes to `main` and version tags such as `v0.2.0`.
+GitHub Actions can publish this image to GHCR after pushes to `main` and version tags such as `v0.3.0`.
 
 Published tags:
 
-- `ghcr.io/che-zhu/codex-gateway:main` for the latest `main` branch image
-- `ghcr.io/che-zhu/codex-gateway:sha-<commit>` for each published commit
-- `ghcr.io/che-zhu/codex-gateway:v0.2.0`, `0.2.0`, `0.2`, `0`, and `latest` when pushing a version tag
+- `ghcr.io/labring/codex-gateway:main` for the latest `main` branch image
+- `ghcr.io/labring/codex-gateway:sha-<commit>` for each published commit
+- `ghcr.io/labring/codex-gateway:v0.3.0`, `0.3.0`, `0.3`, `0`, and `latest` when pushing a version tag
 
 Pull the current `main` image:
 
 ```bash
-docker pull ghcr.io/che-zhu/codex-gateway:main
+docker pull ghcr.io/labring/codex-gateway:main
 ```
 
 Run it the same way as the local image:
@@ -224,7 +224,7 @@ docker run --rm \
   -e CODEX_GATEWAY_HOST=0.0.0.0 \
   -e CODEX_GATEWAY_PORT=1317 \
   -e CODEX_GATEWAY_MAX_SESSIONS=8 \
-  ghcr.io/che-zhu/codex-gateway:main
+  ghcr.io/labring/codex-gateway:main
 ```
 
 If the package is private, authenticate to GHCR before pulling it.
