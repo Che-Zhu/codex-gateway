@@ -147,6 +147,12 @@ impl SessionManager {
         Ok(session.bridge.get_state())
     }
 
+    pub async fn interrupt_turn(&self, session_id: &str) -> Result<BridgeStateSnapshot, AppError> {
+        let session = self.require_session(session_id)?;
+        session.bridge.interrupt_turn().await?;
+        Ok(session.bridge.get_state())
+    }
+
     pub async fn start_new_thread(
         &self,
         session_id: &str,
