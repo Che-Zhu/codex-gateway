@@ -9,8 +9,7 @@
 3. 连接 `GET /api/sessions/:id/events` 订阅该 session 的 SSE
 4. 调用 `POST /api/sessions/:id/turn` 发送用户输入
 5. 通过 SSE 或 `GET /api/sessions/:id/state` 获取当前状态和结果
-6. 如果需要停止当前回复，调用 `POST /api/sessions/:id/turn/interrupt`
-7. 使用结束后调用 `DELETE /api/sessions/:id`
+6. 使用结束后调用 `DELETE /api/sessions/:id`
 
 推荐把一个页面、一个用户会话、或一个业务任务映射到一个 gateway session。
 
@@ -117,31 +116,7 @@ Content-Type: application/json
 - 过程性输出主要通过 SSE 观察
 - 最终结果也可以通过 `GET /api/sessions/:id/state` 中的 `transcript` 查看
 
-### 2.4 停止当前 turn
-
-**请求**
-
-```http
-POST /api/sessions/:id/turn/interrupt
-Content-Type: application/json
-```
-
-请求体可以为空。
-
-用途：
-
-- 停止当前正在运行的 AI 回复
-- 保留当前 session
-- 保留当前 thread 和已有上下文
-- 适合实现 “Stop generating”
-
-说明：
-
-- 这个接口不是删除 session
-- 如果当前没有 active turn，会返回 `409`
-- 如果 active turn 还没有可中断的 `turnId`，也会返回 `409`
-
-### 2.5 查询状态
+### 2.4 查询状态
 
 **请求**
 
@@ -155,7 +130,7 @@ GET /api/sessions/:id/state
 - SSE 中断后做兜底同步
 - 排查问题时查看 `transcript`、`selectedModel`、`threadStatus`
 
-### 2.6 新开 thread
+### 2.5 新开 thread
 
 **请求**
 
@@ -177,7 +152,7 @@ Content-Type: application/json
 - 在保留同一个 session 的前提下，新开一个 thread
 - 适合需要“清空上下文重新开始”，但又不想重建整个 session 的场景
 
-### 2.7 删除 session
+### 2.6 删除 session
 
 **请求**
 
@@ -190,7 +165,7 @@ DELETE /api/sessions/:id
 - 主动释放这个 session 对应的 `codex app-server` 子进程
 - 页面退出、任务完成、或会话明确结束时，建议主动调用
 
-## 2.8 可选鉴权
+## 2.7 可选鉴权
 
 如果服务端设置了 `CODEX_GATEWAY_JWT_SECRET`，除了 `/healthz` 和 `/readyz` 以外，其他路由都需要携带合法的 HS256 JWT。
 

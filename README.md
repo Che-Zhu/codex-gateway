@@ -4,10 +4,6 @@ Chinese version: [README_zh.md](./README_zh.md)
 
 This repository is a minimal multi-session gateway for verifying that `codex app-server` can be exposed as a small HTTP/SSE service.
 
-Architecture notes: [docs/architecture.md](./docs/architecture.md)
-
-API reference: [docs/api.md](./docs/api.md)
-
 The current shape is:
 
 1. external clients call a Rust HTTP API
@@ -65,8 +61,6 @@ That makes the service usable by multiple callers without sharing one thread or 
   - SSE stream for that session only
 - `POST /api/sessions/:id/turn`
   - body: `{ "prompt": "..." }`
-- `POST /api/sessions/:id/turn/interrupt`
-  - requests cancellation of the current in-flight turn while keeping the session
 - `POST /api/sessions/:id/thread/new`
   - body: `{ "model": "optional-model-id" }`
 - `DELETE /api/sessions/:id`
@@ -79,7 +73,6 @@ That makes the service usable by multiple callers without sharing one thread or 
 - session state is in memory only
 - gateway auth is optional and is enabled only when `CODEX_GATEWAY_JWT_SECRET` is set
 - one session can only have one active turn at a time
-- in-flight turns can be interrupted without deleting the session
 
 ## Local usage
 

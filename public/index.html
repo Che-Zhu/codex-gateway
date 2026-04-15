@@ -13,7 +13,7 @@
           <p class="eyebrow">Multi-session gateway</p>
           <h1>Codex Gateway</h1>
           <p class="lede">
-            Browser UI on top of a local Rust gateway. The gateway creates a
+            Browser UI on top of a local Node gateway. The gateway creates a
             session-scoped bridge, starts <code>codex app-server</code>, and
             streams its events into this page.
           </p>
@@ -103,10 +103,7 @@
             <p class="hint" id="hint-text">
               Approval requests are auto-declined in this gateway demo.
             </p>
-            <div class="composer-buttons">
-              <button id="stop-turn" class="ghost" type="button">Stop</button>
-              <button id="send" type="submit">Send</button>
-            </div>
+            <button id="send" type="submit">Send</button>
           </div>
           <p id="error" class="error" hidden></p>
         </form>

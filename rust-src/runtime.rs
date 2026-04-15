@@ -47,9 +47,7 @@ pub fn maybe_login_with_api_key(codex_bin: &str) -> Result<bool, RuntimeError> {
     args.push("--with-api-key".to_string());
 
     if let Some(base_url) = base_url {
-        println!(
-            "Initializing Codex auth from configured OpenAI API key with base URL override {base_url}"
-        );
+        println!("Initializing Codex auth from configured OpenAI API key with base URL override {base_url}");
     } else {
         println!("Initializing Codex auth from configured OpenAI API key");
     }
@@ -62,9 +60,11 @@ pub fn maybe_login_with_api_key(codex_bin: &str) -> Result<bool, RuntimeError> {
         .stderr(Stdio::inherit());
     apply_codex_child_env(&mut child);
 
-    let mut child = child.spawn().map_err(|error| {
-        RuntimeError::Message(format!("Failed to start {codex_bin} login: {error}"))
-    })?;
+    let mut child = child
+        .spawn()
+        .map_err(|error| {
+            RuntimeError::Message(format!("Failed to start {codex_bin} login: {error}"))
+        })?;
 
     let Some(stdin) = child.stdin.as_mut() else {
         return Err(RuntimeError::Message(format!(

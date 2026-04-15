@@ -4,10 +4,6 @@ English version: [README.md](./README.md)
 
 这个仓库当前的定位，是一个最小化的多 session `Codex gateway`，用于验证 `codex app-server` 能不能通过 Rust HTTP/SSE 服务对外暴露。
 
-架构说明： [docs/architecture.md](./docs/architecture.md)
-
-API 文档： [docs/api.md](./docs/api.md)
-
 ## 当前形态
 
 整体链路是：
@@ -67,8 +63,6 @@ API 文档： [docs/api.md](./docs/api.md)
   - 只属于该 session 的 SSE 流
 - `POST /api/sessions/:id/turn`
   - 请求体：`{ "prompt": "..." }`
-- `POST /api/sessions/:id/turn/interrupt`
-  - 请求停止当前正在运行的 turn，同时保留 session
 - `POST /api/sessions/:id/thread/new`
   - 请求体：`{ "model": "可选模型 ID" }`
 - `DELETE /api/sessions/:id`
@@ -81,7 +75,6 @@ API 文档： [docs/api.md](./docs/api.md)
 - session 状态只存在内存里，不持久化
 - gateway 鉴权是可选的，只有设置 `CODEX_GATEWAY_JWT_SECRET` 时才会开启
 - 单个 session 同一时间只能有一个 active turn
-- 正在运行的 turn 可以被 interrupt，不需要删除整个 session
 
 ## 本地运行
 

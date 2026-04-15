@@ -80,7 +80,9 @@ async fn main() -> Result<(), AppError> {
 }
 
 fn build_router(state: AppState) -> Router {
-    let auth_state = Arc::new(AuthState::new(state.session_manager.config().auth.clone()));
+    let auth_state = Arc::new(AuthState::new(
+        state.session_manager.config().auth.clone(),
+    ));
 
     let protected = Router::new()
         .route("/", get(index_html))
@@ -106,10 +108,6 @@ fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{id}/state", get(get_session_state))
         .route("/api/sessions/{id}/events", get(get_session_events))
         .route("/api/sessions/{id}/turn", post(post_turn))
-        .route(
-            "/api/sessions/{id}/turn/interrupt",
-            post(post_interrupt_turn),
-        )
         .route("/api/sessions/{id}/thread/new", post(post_new_thread))
         .route("/api/sessions/{id}", delete(delete_session))
         .route_layer(middleware::from_fn_with_state(
@@ -239,21 +237,6 @@ async fn post_turn(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::bad_request("Prompt must not be empty"))?;
     let snapshot = state.session_manager.send_prompt(&id, &prompt).await?;
-    let session = state.session_manager.get_session_info(&id)?;
-
-    Ok(Json(json!({
-        "ok": true,
-        "sessionId": id,
-        "session": session,
-        "state": snapshot,
-    })))
-}
-
-async fn post_interrupt_turn(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let snapshot = state.session_manager.interrupt_turn(&id).await?;
     let session = state.session_manager.get_session_info(&id)?;
 
     Ok(Json(json!({
