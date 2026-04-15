@@ -327,19 +327,100 @@ impl CodexAppServerBridge {
             .thread_id
             .ok_or_else(|| AppError::internal("Thread not ready for turn/start"))?;
 
-        self.request(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": prompt
+        let result = self
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }),
+            )
+            .await;
+
+        match result {
+            Ok(result) => {
+                let turn_id = result
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let status = result
+                    .get("turn")
+                    .and_then(|turn| turn.get("status"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+
+                self.with_state(|state| {
+                    if let Some(turn_id) = turn_id {
+                        state.current_turn_id = Some(turn_id);
                     }
-                ]
-            }),
-        )
-        .await
+                    if let Some(status) = status {
+                        state.last_turn_status = Some(status);
+                    }
+                });
+                self.emit_state();
+                Ok(result)
+            }
+            Err(error) => {
+                self.with_state(|state| {
+                    state.current_turn_id = None;
+                    state.active_turn = false;
+                    state.last_turn_status = Some("failed".to_string());
+                });
+                self.emit_state();
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn interrupt_turn(&self) -> Result<Value, AppError> {
+        let state = self.get_state();
+        if !state.active_turn {
+            return Err(AppError::conflict("No active turn to interrupt"));
+        }
+
+        let thread_id = state
+            .thread_id
+            .clone()
+            .ok_or_else(|| AppError::conflict("No active thread to interrupt"))?;
+        let turn_id = state
+            .current_turn_id
+            .clone()
+            .ok_or_else(|| AppError::conflict("Active turn is not ready to interrupt yet"))?;
+        let requested_turn_id = turn_id.clone();
+
+        let result = self
+            .request(
+                "turn/interrupt",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id
+                }),
+            )
+            .await?;
+
+        self.with_state(|state| {
+            if state.active_turn {
+                state.last_turn_status = Some("interruptRequested".to_string());
+            }
+        });
+        self.record_summary_event(SummaryEvent {
+            at: Utc::now().to_rfc3339(),
+            event_type: "local".to_string(),
+            method: Some("turn/interrupt".to_string()),
+            item_type: None,
+            item_id: Some(requested_turn_id),
+            status: Some("accepted".to_string()),
+            text_preview: Some("Interrupt requested".to_string()),
+        });
+        self.emit_state();
+
+        Ok(result)
     }
 
     pub async fn wait_for_turn_completion(&self, timeout: Duration) -> Result<Value, AppError> {

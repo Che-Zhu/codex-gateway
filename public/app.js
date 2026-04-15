@@ -11,6 +11,7 @@ const eventCountEl = document.querySelector("#event-count");
 const formEl = document.querySelector("#composer");
 const promptEl = document.querySelector("#prompt");
 const sendEl = document.querySelector("#send");
+const stopEl = document.querySelector("#stop-turn");
 const newThreadEl = document.querySelector("#new-thread");
 const errorEl = document.querySelector("#error");
 const authTokenEl = document.querySelector("#auth-token");
@@ -132,6 +133,7 @@ function renderControls() {
   const busy = Boolean(state?.activeTurn);
   const unavailable = !sessionId;
   sendEl.disabled = busy || unavailable;
+  stopEl.disabled = !busy || unavailable || !state?.currentTurnId;
   newThreadEl.disabled = busy || unavailable;
   modelSelectEl.disabled = busy || unavailable;
   promptEl.disabled = !state?.ready || unavailable;
@@ -247,6 +249,16 @@ newThreadEl.addEventListener("click", async () => {
     await postJson(sessionPath("/thread/new"), {
       model: modelSelectEl.value || undefined,
     });
+  } catch (error) {
+    showError(error.message);
+  }
+});
+
+stopEl.addEventListener("click", async () => {
+  clearError();
+
+  try {
+    await postJson(sessionPath("/turn/interrupt"), {});
   } catch (error) {
     showError(error.message);
   }
