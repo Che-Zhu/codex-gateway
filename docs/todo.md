@@ -6,6 +6,10 @@
 
 ### Thread history and resume
 
+Status: initial implementation landed.
+
+Detail: [`docs/todo-p0.md`](todo-p0.md)
+
 App-server methods:
 
 - `thread/list`
@@ -18,28 +22,18 @@ Why:
 - 支持历史会话列表。
 - 支持读取完整 thread 历史。
 
-Current gap:
+Implemented:
 
-- Gateway session 仍然只存在内存里。
-- 浏览器刷新后不会自动恢复旧 session。
+- `GET /api/threads`
+- `GET /api/threads/:threadId`
+- `POST /api/sessions` 支持 `resumeThreadId`
+- `POST /api/sessions/:id/thread/resume`
+- 内置 Web UI 会保存 `sessionId` 和 `threadId`，刷新后先复用 session，失败后恢复 thread。
 
-### Approval UI
+Remaining gap:
 
-App-server behavior:
-
-- `item/commandExecution/requestApproval`
-- `item/fileChange/requestApproval`
-
-Why:
-
-- 真实 coding agent 工作流需要用户批准命令执行和文件修改。
-- 当前 Gateway 已经默认使用最高权限，交互式审批 UI 只有在以后需要收紧权限时才需要补齐。
-
-Current gap:
-
-- Gateway 当前会以 `sandbox_mode="danger-full-access"` 和 `approval_policy="never"` 启动 app-server。
-- 如果 approval request 仍然出现，Gateway 会自动接受。
-- Web UI 没有审批弹窗或审批 API。
+- Gateway session 仍然只存在内存里，进程重启后需要依赖 app-server thread 历史恢复。
+- 历史列表 UI 仍是最小实现，还没有搜索、归档、命名等完整会话管理能力。
 
 ## P1
 

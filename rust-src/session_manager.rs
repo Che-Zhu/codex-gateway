@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::Receiver;
 use tracing::{error, info};
@@ -67,6 +68,7 @@ impl SessionManager {
     pub async fn create_session(
         &self,
         model: Option<String>,
+        resume_thread_id: Option<String>,
     ) -> Result<(String, SessionInfo, BridgeStateSnapshot), AppError> {
         let _guard = self.inner.create_lock.lock().await;
         self.sweep_expired_sessions().await;
@@ -89,12 +91,15 @@ impl SessionManager {
             activity_touch: metadata.touch_callback(self.inner.config.session_ttl),
         });
 
-        bridge.start().await?;
-        if let Some(model) = model {
-            let current_model = bridge.get_state().selected_model;
-            if current_model.as_deref() != Some(model.as_str()) {
-                bridge.start_new_thread(Some(model)).await?;
-            }
+        bridge.start_without_thread().await?;
+        let init_result = if let Some(thread_id) = resume_thread_id {
+            bridge.resume_thread(&thread_id).await.map(|_| ())
+        } else {
+            bridge.start_new_thread(model).await.map(|_| ())
+        };
+        if let Err(error) = init_result {
+            let _ = bridge.stop().await;
+            return Err(error);
         }
 
         let session = Arc::new(Session {
@@ -113,6 +118,38 @@ impl SessionManager {
         info!("session created {}", id);
 
         Ok((id, info, state))
+    }
+
+    pub async fn list_threads(&self, params: Value) -> Result<Value, AppError> {
+        if let Some(session) = self.first_session() {
+            session.metadata.touch(self.inner.config.session_ttl);
+            return session.bridge.list_threads(params).await;
+        }
+
+        let bridge = self.new_transient_bridge();
+        bridge.start_without_thread().await?;
+        let result = bridge.list_threads(params).await;
+        let stop_result = bridge.stop().await;
+        if let Err(error) = stop_result {
+            error!("failed to stop transient app-server bridge: {error}");
+        }
+        result
+    }
+
+    pub async fn read_thread(&self, thread_id: &str) -> Result<Value, AppError> {
+        if let Some(session) = self.first_session() {
+            session.metadata.touch(self.inner.config.session_ttl);
+            return session.bridge.read_thread(thread_id).await;
+        }
+
+        let bridge = self.new_transient_bridge();
+        bridge.start_without_thread().await?;
+        let result = bridge.read_thread(thread_id).await;
+        let stop_result = bridge.stop().await;
+        if let Err(error) = stop_result {
+            error!("failed to stop transient app-server bridge: {error}");
+        }
+        result
     }
 
     pub fn get_state(&self, session_id: &str) -> Result<BridgeStateSnapshot, AppError> {
@@ -160,6 +197,16 @@ impl SessionManager {
     ) -> Result<BridgeStateSnapshot, AppError> {
         let session = self.require_session(session_id)?;
         session.bridge.start_new_thread(model).await?;
+        Ok(session.bridge.get_state())
+    }
+
+    pub async fn resume_thread(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+    ) -> Result<BridgeStateSnapshot, AppError> {
+        let session = self.require_session(session_id)?;
+        session.bridge.resume_thread(thread_id).await?;
         Ok(session.bridge.get_state())
     }
 
@@ -227,6 +274,21 @@ impl SessionManager {
             .ok_or_else(|| AppError::not_found(format!("Unknown session: {session_id}")))?;
         session.metadata.touch(self.inner.config.session_ttl);
         Ok(session)
+    }
+
+    fn first_session(&self) -> Option<Arc<Session>> {
+        self.inner.sessions.read().unwrap().values().next().cloned()
+    }
+
+    fn new_transient_bridge(&self) -> CodexAppServerBridge {
+        CodexAppServerBridge::new(BridgeOptions {
+            cwd: self.inner.config.bridge_cwd.clone(),
+            codex_bin: self.inner.config.codex_bin.clone(),
+            debug: self.inner.config.debug,
+            client_info: self.inner.config.client_info.clone(),
+            default_model: self.inner.config.default_model.clone(),
+            activity_touch: Arc::new(|| {}),
+        })
     }
 
     fn spawn_sweeper(&self) {

@@ -31,7 +31,6 @@ API 文档： [docs/api.md](./docs/api.md)
 - `rust-src/runtime.rs`：运行时辅助模块，负责 API key 登录和 `openai_base_url` 覆盖
 - `rust-src/session_manager.rs`：多 session 生命周期管理，包含 TTL 回收
 - `rust-src/cli.rs`：单次 CLI 冒烟验证
-- `src/*.mjs`：上一版 Node 实现，暂时保留作为迁移参考
 - `public/index.html`：最小化 Web UI
 - `public/app.js`：浏览器端逻辑，会自动创建自己的 session 并订阅自己的 SSE
 - `public/styles.css`：样式
@@ -77,8 +76,9 @@ API 文档： [docs/api.md](./docs/api.md)
 ### 当前 PoC 行为
 
 - `codex app-server` 会以 `sandbox_mode="danger-full-access"` 和 `approval_policy="never"` 启动
-- 如果命令执行或文件修改审批请求仍然出现，Gateway 会自动接受
-- 不支持的 server 发起请求会被拒绝
+- 如果旧版或新版 approval request 仍然出现，Gateway 会自动接受
+- dynamic tool call 会收到结构化 tool result；不支持的 tool 会显式失败，而不是把 turn 卡住
+- 仍然依赖交互式 UI 的 server 发起请求会被显式拒绝或取消
 - session 状态只存在内存里，不持久化
 - gateway 鉴权是可选的，只有设置 `CODEX_GATEWAY_JWT_SECRET` 时才会开启
 - 单个 session 同一时间只能有一个 active turn
@@ -103,7 +103,7 @@ cargo run --bin codex-gateway
 http://127.0.0.1:1317
 ```
 
-页面会自动创建一个新的 session，自动连接它自己的 SSE 流，并在标签页关闭时尽量删除这个 session。开启 JWT 鉴权后，需要先在侧边栏的 `Auth` 输入框里填入 Bearer token。
+页面会优先恢复上一次仍然存活的 session，失败时尝试恢复上一次的 thread，并自动连接它自己的 SSE 流。开启 JWT 鉴权后，需要先在侧边栏的 `Auth` 输入框里填入 Bearer token。
 
 ### CLI 冒烟
 
@@ -244,4 +244,4 @@ docker run --rm \
 - 没有持久化 session
 - 没有审批 UI，因为当前 Gateway 默认使用最高权限
 - 每个活跃 session 都会占用一个 `codex app-server` 子进程
-- 浏览器刷新后不会自动恢复原 session，除非调用方自己保存 `sessionId`
+- 浏览器可以通过保存 `sessionId` 和 `threadId` 做刷新恢复，但 gateway session 本身仍然只存在内存里
