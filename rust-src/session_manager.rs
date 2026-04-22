@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::Receiver;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::bridge::{BridgeOptions, CodexAppServerBridge};
@@ -74,6 +74,11 @@ impl SessionManager {
         self.sweep_expired_sessions().await;
 
         if self.count() >= self.inner.config.max_sessions {
+            warn!(
+                active_sessions = self.count(),
+                max_sessions = self.inner.config.max_sessions,
+                "maximum concurrent sessions reached"
+            );
             return Err(AppError::service_unavailable(format!(
                 "Maximum concurrent sessions reached ({})",
                 self.inner.config.max_sessions
@@ -81,6 +86,12 @@ impl SessionManager {
         }
 
         let id = Uuid::new_v4().to_string();
+        info!(
+            session_id = %id,
+            model = model.as_deref().unwrap_or("-"),
+            resume_thread_id = resume_thread_id.as_deref().unwrap_or("-"),
+            "allocating session"
+        );
         let metadata = Arc::new(SessionMetadata::new(self.inner.config.session_ttl));
         let bridge = CodexAppServerBridge::new(BridgeOptions {
             cwd: self.inner.config.bridge_cwd.clone(),
@@ -123,9 +134,11 @@ impl SessionManager {
     pub async fn list_threads(&self, params: Value) -> Result<Value, AppError> {
         if let Some(session) = self.first_session() {
             session.metadata.touch(self.inner.config.session_ttl);
+            info!(session_id = %session.id, "listing threads with active session bridge");
             return session.bridge.list_threads(params).await;
         }
 
+        info!("listing threads with transient bridge");
         let bridge = self.new_transient_bridge();
         bridge.start_without_thread().await?;
         let result = bridge.list_threads(params).await;
@@ -139,9 +152,15 @@ impl SessionManager {
     pub async fn read_thread(&self, thread_id: &str) -> Result<Value, AppError> {
         if let Some(session) = self.first_session() {
             session.metadata.touch(self.inner.config.session_ttl);
+            info!(
+                session_id = %session.id,
+                thread_id = %thread_id,
+                "reading thread with active session bridge"
+            );
             return session.bridge.read_thread(thread_id).await;
         }
 
+        info!(thread_id = %thread_id, "reading thread with transient bridge");
         let bridge = self.new_transient_bridge();
         bridge.start_without_thread().await?;
         let result = bridge.read_thread(thread_id).await;
@@ -167,6 +186,7 @@ impl SessionManager {
         session_id: &str,
     ) -> Result<(SessionInfo, BridgeStateSnapshot, Receiver<BridgeEvent>), AppError> {
         let session = self.require_session(session_id)?;
+        info!(session_id = %session_id, "subscribing to session events");
         Ok((
             session.info(),
             session.bridge.get_state(),
@@ -180,12 +200,18 @@ impl SessionManager {
         prompt: &str,
     ) -> Result<BridgeStateSnapshot, AppError> {
         let session = self.require_session(session_id)?;
+        info!(
+            session_id = %session_id,
+            prompt_len = prompt.chars().count(),
+            "forwarding prompt to bridge"
+        );
         session.bridge.send_prompt(prompt).await?;
         Ok(session.bridge.get_state())
     }
 
     pub async fn interrupt_turn(&self, session_id: &str) -> Result<BridgeStateSnapshot, AppError> {
         let session = self.require_session(session_id)?;
+        info!(session_id = %session_id, "forwarding interrupt to bridge");
         session.bridge.interrupt_turn().await?;
         Ok(session.bridge.get_state())
     }
@@ -196,6 +222,11 @@ impl SessionManager {
         model: Option<String>,
     ) -> Result<BridgeStateSnapshot, AppError> {
         let session = self.require_session(session_id)?;
+        info!(
+            session_id = %session_id,
+            model = model.as_deref().unwrap_or("-"),
+            "forwarding new thread request to bridge"
+        );
         session.bridge.start_new_thread(model).await?;
         Ok(session.bridge.get_state())
     }
@@ -206,6 +237,11 @@ impl SessionManager {
         thread_id: &str,
     ) -> Result<BridgeStateSnapshot, AppError> {
         let session = self.require_session(session_id)?;
+        info!(
+            session_id = %session_id,
+            thread_id = %thread_id,
+            "forwarding thread resume request to bridge"
+        );
         session.bridge.resume_thread(thread_id).await?;
         Ok(session.bridge.get_state())
     }
@@ -294,6 +330,11 @@ impl SessionManager {
     fn spawn_sweeper(&self) {
         let manager = self.clone();
         tokio::spawn(async move {
+            info!(
+                session_sweep_interval_ms = manager.inner.config.session_sweep_interval.as_millis()
+                    as u64,
+                "session sweeper started"
+            );
             loop {
                 tokio::time::sleep(manager.inner.config.session_sweep_interval).await;
                 manager.sweep_expired_sessions().await;

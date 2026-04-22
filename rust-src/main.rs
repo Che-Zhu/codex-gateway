@@ -2,13 +2,14 @@ use std::convert::Infallible;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
-use axum::middleware;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post};
@@ -17,7 +18,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
-use tracing::error;
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use codex_gateway::auth::{AuthState, auth_middleware};
 use codex_gateway::error::AppError;
@@ -71,6 +73,19 @@ async fn main() -> Result<(), AppError> {
 
     let root_dir = env::current_dir()?;
     let config = AppConfig::from_env(root_dir);
+    info!(
+        host = %config.host,
+        port = config.port,
+        bridge_cwd = %config.bridge_cwd.display(),
+        public_dir = %config.public_dir.display(),
+        codex_bin = %config.codex_bin,
+        auth_enabled = config.auth.is_some(),
+        debug = config.debug,
+        max_sessions = config.max_sessions,
+        session_ttl_ms = config.session_ttl.as_millis() as u64,
+        session_sweep_interval_ms = config.session_sweep_interval.as_millis() as u64,
+        "gateway configuration loaded"
+    );
     maybe_login_with_api_key(&config.codex_bin)?;
 
     let session_manager = SessionManager::new(config.clone());
@@ -86,6 +101,7 @@ async fn main() -> Result<(), AppError> {
         "Codex gateway listening at http://{}:{}",
         config.host, config.port
     );
+    info!(host = %config.host, port = config.port, "gateway listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -145,6 +161,7 @@ fn build_router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .merge(protected)
         .fallback(not_found)
+        .layer(middleware::from_fn(access_log_middleware))
         .with_state(state)
 }
 
@@ -197,12 +214,26 @@ async fn create_session(
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let request: CreateSessionRequest = parse_json_body(body)?;
+    let raw_model = request.model.clone();
+    let raw_resume_thread_id = request.resume_thread_id.clone();
     let model = trim_optional(request.model);
     let resume_thread_id = trim_optional(request.resume_thread_id);
+    info!(
+        input_model = raw_model.as_deref().unwrap_or(""),
+        input_resume_thread_id = raw_resume_thread_id.as_deref().unwrap_or(""),
+        model = model.as_deref().unwrap_or("-"),
+        resume_thread_id = resume_thread_id.as_deref().unwrap_or("-"),
+        "creating session"
+    );
     let (session_id, session, snapshot) = state
         .session_manager
         .create_session(model, resume_thread_id)
         .await?;
+    info!(
+        session_id = %session_id,
+        thread_id = snapshot.thread_id.as_deref().unwrap_or("-"),
+        "session created via http"
+    );
 
     Ok(Json(json!({
         "ok": true,
@@ -216,10 +247,25 @@ async fn get_threads(
     State(state): State<AppState>,
     Query(query): Query<ThreadListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    info!(
+        cursor = query.cursor.as_deref().unwrap_or("-"),
+        limit = query.limit.unwrap_or_default(),
+        sort_key = query.sort_key.as_deref().unwrap_or("-"),
+        archived = query.archived.unwrap_or(false),
+        cwd = query.cwd.as_deref().unwrap_or("-"),
+        search_term = query.search_term.as_deref().unwrap_or("-"),
+        "listing threads"
+    );
     let result = state
         .session_manager
         .list_threads(thread_list_params(query))
         .await?;
+    let thread_count = result
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    info!(thread_count, "listed threads");
 
     Ok(Json(json!({
         "ok": true,
@@ -233,8 +279,10 @@ async fn get_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    info!(input_thread_id = %thread_id, thread_id = %thread_id, "reading thread");
     let result = state.session_manager.read_thread(&thread_id).await?;
     let thread = result.get("thread").cloned().unwrap_or_else(|| json!({}));
+    info!(thread_id = %thread_id, "thread read completed");
 
     Ok(Json(json!({
         "ok": true,
@@ -248,6 +296,7 @@ async fn get_session_state(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    info!(input_session_id = %id, session_id = %id, "fetching session state");
     let session = state.session_manager.get_session_info(&id)?;
     let snapshot = state.session_manager.get_state(&id)?;
 
@@ -264,16 +313,32 @@ async fn get_session_events(
     Path(id): Path<String>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
     let (session, snapshot, mut receiver) = state.session_manager.subscribe(&id)?;
+    info!(
+        input_session_id = %id,
+        session_id = %session.id,
+        "sse session events connected"
+    );
+    let session_id = session.id.clone();
 
     let stream = stream! {
+        let _guard = SseSessionGuard {
+            session_id: session_id.clone(),
+            connected_at: Instant::now(),
+        };
         yield Ok(sse_json_event("session", &session));
         yield Ok(sse_json_event("state", &snapshot));
 
         loop {
             match receiver.recv().await {
                 Ok(event) => yield Ok(bridge_event_to_sse(event)),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(session_id = %session_id, skipped, "sse event receiver lagged");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    info!(session_id = %session_id, "sse event receiver closed");
+                    break;
+                }
             }
         }
     };
@@ -291,13 +356,27 @@ async fn post_turn(
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let request: TurnRequest = parse_json_body(body)?;
+    let raw_prompt = request.prompt.clone();
     let prompt = request
         .prompt
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::bad_request("Prompt must not be empty"))?;
+    info!(
+        session_id = %id,
+        input_prompt = raw_prompt.as_deref().unwrap_or(""),
+        prompt = %prompt,
+        prompt_len = prompt.chars().count(),
+        "starting turn"
+    );
     let snapshot = state.session_manager.send_prompt(&id, &prompt).await?;
     let session = state.session_manager.get_session_info(&id)?;
+    info!(
+        session_id = %id,
+        thread_id = snapshot.thread_id.as_deref().unwrap_or("-"),
+        turn_id = snapshot.current_turn_id.as_deref().unwrap_or("-"),
+        "turn start accepted"
+    );
 
     Ok(Json(json!({
         "ok": true,
@@ -311,6 +390,7 @@ async fn post_interrupt_turn(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    info!(session_id = %id, "interrupting active turn");
     let snapshot = state.session_manager.interrupt_turn(&id).await?;
     let session = state.session_manager.get_session_info(&id)?;
 
@@ -328,7 +408,14 @@ async fn post_new_thread(
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let request: ThreadRequest = parse_json_body(body)?;
+    let raw_model = request.model.clone();
     let model = trim_optional(request.model);
+    info!(
+        session_id = %id,
+        input_model = raw_model.as_deref().unwrap_or(""),
+        model = model.as_deref().unwrap_or("-"),
+        "starting new thread"
+    );
     let snapshot = state.session_manager.start_new_thread(&id, model).await?;
     let session = state.session_manager.get_session_info(&id)?;
 
@@ -346,8 +433,15 @@ async fn post_resume_thread(
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let request: ThreadResumeRequest = parse_json_body(body)?;
+    let raw_thread_id = request.thread_id.clone();
     let thread_id = trim_optional(request.thread_id)
         .ok_or_else(|| AppError::bad_request("threadId must not be empty"))?;
+    info!(
+        session_id = %id,
+        input_thread_id = raw_thread_id.as_deref().unwrap_or(""),
+        thread_id = %thread_id,
+        "resuming thread"
+    );
     let snapshot = state.session_manager.resume_thread(&id, &thread_id).await?;
     let session = state.session_manager.get_session_info(&id)?;
 
@@ -363,6 +457,7 @@ async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    info!(input_session_id = %id, session_id = %id, "deleting session");
     let removed = state.session_manager.close_session(&id, "deleted").await?;
     if !removed {
         return Err(AppError::not_found(format!("Unknown session: {id}")));
@@ -450,6 +545,7 @@ async fn serve_static_file(
     path: PathBuf,
     content_type: &'static str,
 ) -> Result<impl IntoResponse, AppError> {
+    info!(path = %path.display(), content_type, "serving static file");
     let bytes = tokio::fs::read(path).await?;
     Ok((
         [
@@ -467,6 +563,97 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+struct SseSessionGuard {
+    session_id: String,
+    connected_at: Instant,
+}
+
+impl Drop for SseSessionGuard {
+    fn drop(&mut self) {
+        info!(
+            session_id = %self.session_id,
+            duration_ms = self.connected_at.elapsed().as_millis() as u64,
+            "sse session events disconnected"
+        );
+    }
+}
+
+async fn access_log_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let request_id = Uuid::new_v4().to_string();
+    let session_id = extract_session_id(&path);
+    let thread_id = extract_thread_id(&path);
+    let started_at = Instant::now();
+
+    let mut response = next.run(req).await;
+    let status = response.status();
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+
+    let session_id = session_id.unwrap_or_else(|| "-".to_string());
+    let thread_id = thread_id.unwrap_or_else(|| "-".to_string());
+    if status.is_server_error() {
+        error!(
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            duration_ms,
+            session_id = %session_id,
+            thread_id = %thread_id,
+            "http request failed"
+        );
+    } else if status.is_client_error() {
+        warn!(
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            duration_ms,
+            session_id = %session_id,
+            thread_id = %thread_id,
+            "http request rejected"
+        );
+    } else {
+        info!(
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            duration_ms,
+            session_id = %session_id,
+            thread_id = %thread_id,
+            "http request completed"
+        );
+    }
+
+    response
+}
+
+fn extract_session_id(path: &str) -> Option<String> {
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.len() >= 3 && segments[0] == "api" && segments[1] == "sessions" {
+        Some(segments[2].to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_thread_id(path: &str) -> Option<String> {
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.len() >= 3 && segments[0] == "api" && segments[1] == "threads" {
+        Some(segments[2].to_string())
+    } else {
+        None
+    }
 }
 
 async fn shutdown_signal() {
