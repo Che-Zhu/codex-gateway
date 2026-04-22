@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -61,6 +62,14 @@ struct PendingRequest {
     tx: oneshot::Sender<Result<Value, AppError>>,
 }
 
+struct HandledServerRequest {
+    result: Value,
+    item_type: Option<String>,
+    status: String,
+    text_preview: Option<String>,
+    system_note: Option<String>,
+}
+
 impl CodexAppServerBridge {
     pub fn new(options: BridgeOptions) -> Self {
         let cwd = options.cwd.display().to_string();
@@ -96,6 +105,14 @@ impl CodexAppServerBridge {
     }
 
     pub async fn start(&self) -> Result<BridgeStateSnapshot, AppError> {
+        self.start_inner(true).await
+    }
+
+    pub async fn start_without_thread(&self) -> Result<BridgeStateSnapshot, AppError> {
+        self.start_inner(false).await
+    }
+
+    async fn start_inner(&self, start_thread: bool) -> Result<BridgeStateSnapshot, AppError> {
         if self.inner.started.load(Ordering::SeqCst) {
             return Ok(self.get_state());
         }
@@ -141,7 +158,9 @@ impl CodexAppServerBridge {
 
         self.refresh_account().await?;
         self.refresh_models().await?;
-        self.start_new_thread(None).await?;
+        if start_thread {
+            self.start_new_thread(None).await?;
+        }
 
         self.with_state(|state| {
             state.ready = true;
@@ -291,6 +310,90 @@ impl CodexAppServerBridge {
         });
         self.emit_state();
         Ok(thread_id)
+    }
+
+    pub async fn list_threads(&self, params: Value) -> Result<Value, AppError> {
+        self.request("thread/list", params).await
+    }
+
+    pub async fn read_thread(&self, thread_id: &str) -> Result<Value, AppError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(AppError::bad_request("threadId must not be empty"));
+        }
+
+        self.request(
+            "thread/read",
+            json!({
+                "threadId": thread_id,
+                "includeTurns": true
+            }),
+        )
+        .await
+    }
+
+    pub async fn resume_thread(&self, thread_id: &str) -> Result<Value, AppError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(AppError::bad_request("threadId must not be empty"));
+        }
+
+        if self.get_state().active_turn {
+            return Err(AppError::conflict(
+                "Cannot resume thread while a turn is active",
+            ));
+        }
+
+        let result = self
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": self.inner.cwd,
+                    "persistExtendedHistory": false
+                }),
+            )
+            .await?;
+
+        let thread = result.get("thread").cloned().unwrap_or_else(|| json!({}));
+        let transcript = transcript_from_thread(&thread);
+        let resumed_thread_id = thread
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(thread_id)
+            .to_string();
+        let model = result
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| self.get_state().selected_model);
+        let thread_status = thread
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "idle" }));
+        let active_turn = thread_status.get("type").and_then(Value::as_str) == Some("active");
+
+        self.with_state(|state| {
+            state.thread_id = Some(resumed_thread_id.clone());
+            state.selected_model = model;
+            state.thread_status = Some(thread_status);
+            state.current_turn_id = None;
+            state.active_turn = active_turn;
+            state.last_turn_status = None;
+            state.transcript = transcript;
+        });
+        self.record_summary_event(SummaryEvent {
+            at: Utc::now().to_rfc3339(),
+            event_type: "local".to_string(),
+            method: Some("thread/resume".to_string()),
+            item_type: None,
+            item_id: None,
+            status: Some("completed".to_string()),
+            text_preview: Some(format!("Resumed thread {resumed_thread_id}")),
+        });
+        self.emit_state();
+
+        Ok(result)
     }
 
     pub async fn send_prompt(&self, prompt_text: &str) -> Result<Value, AppError> {
@@ -721,30 +824,23 @@ impl CodexAppServerBridge {
             .to_string();
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
 
-        if method == "item/commandExecution/requestApproval"
-            || method == "item/fileChange/requestApproval"
-        {
-            let decision = auto_approval_decision(&params);
+        if let Some(handled) = self.auto_handle_server_request(&method, &params) {
             let _ = self.send_json(&json!({
                 "id": id,
-                "result": decision
+                "result": handled.result
             }));
             self.record_summary_event(SummaryEvent {
                 at: Utc::now().to_rfc3339(),
                 event_type: "serverRequest".to_string(),
                 method: Some(method.clone()),
-                item_type: Some(if method.contains("commandExecution") {
-                    "commandExecution".to_string()
-                } else {
-                    "fileChange".to_string()
-                }),
+                item_type: handled.item_type.clone(),
                 item_id: None,
-                status: Some("auto-accepted".to_string()),
-                text_preview: preview(params.get("reason"))
-                    .or_else(|| preview(params.get("command")))
-                    .or_else(|| preview(params.get("cwd"))),
+                status: Some(handled.status.clone()),
+                text_preview: handled.text_preview.clone(),
             });
-            self.push_system_note(format!("Auto-accepted {method} in the gateway web UI."));
+            if let Some(note) = handled.system_note.clone() {
+                self.push_system_note(note);
+            }
             let _ = self
                 .inner
                 .events
@@ -752,7 +848,7 @@ impl CodexAppServerBridge {
                     method,
                     params,
                     handled: true,
-                    result: Some(decision.to_string()),
+                    result: Some(compact_json(&handled.result)),
                     error: None,
                 }));
             self.emit_state();
@@ -789,8 +885,186 @@ impl CodexAppServerBridge {
                 handled: false,
                 result: None,
                 error: Some(error),
-            }));
+        }));
         self.emit_state();
+    }
+
+    fn auto_handle_server_request(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Option<HandledServerRequest> {
+        match method {
+            "item/commandExecution/requestApproval" => {
+                let decision = auto_approval_decision(params);
+                Some(HandledServerRequest {
+                    result: json!({ "decision": decision }),
+                    item_type: Some("commandExecution".to_string()),
+                    status: "auto-accepted".to_string(),
+                    text_preview: preview(params.get("reason"))
+                        .or_else(|| preview(params.get("command")))
+                        .or_else(|| preview(params.get("cwd"))),
+                    system_note: Some(format!("Auto-accepted {method} in the gateway.")),
+                })
+            }
+            "item/fileChange/requestApproval" => {
+                let decision = auto_approval_decision(params);
+                Some(HandledServerRequest {
+                    result: json!({ "decision": decision }),
+                    item_type: Some("fileChange".to_string()),
+                    status: "auto-accepted".to_string(),
+                    text_preview: preview(params.get("reason"))
+                        .or_else(|| preview(params.get("grantRoot"))),
+                    system_note: Some(format!("Auto-accepted {method} in the gateway.")),
+                })
+            }
+            "item/permissions/requestApproval" => Some(HandledServerRequest {
+                result: json!({
+                    "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})),
+                    "scope": "session"
+                }),
+                item_type: Some("permissions".to_string()),
+                status: "auto-accepted".to_string(),
+                text_preview: preview(params.get("reason")),
+                system_note: Some(format!("Auto-accepted {method} in the gateway.")),
+            }),
+            "execCommandApproval" => Some(HandledServerRequest {
+                result: json!({ "decision": "approved_for_session" }),
+                item_type: Some("commandExecution".to_string()),
+                status: "auto-accepted".to_string(),
+                text_preview: preview(params.get("reason"))
+                    .or_else(|| preview(params.get("cwd"))),
+                system_note: Some(format!("Auto-accepted {method} in the gateway.")),
+            }),
+            "applyPatchApproval" => Some(HandledServerRequest {
+                result: json!({ "decision": "approved_for_session" }),
+                item_type: Some("fileChange".to_string()),
+                status: "auto-accepted".to_string(),
+                text_preview: preview(params.get("reason"))
+                    .or_else(|| preview(params.get("grantRoot"))),
+                system_note: Some(format!("Auto-accepted {method} in the gateway.")),
+            }),
+            "item/tool/call" => Some(self.handle_dynamic_tool_call(params)),
+            "item/tool/requestUserInput" => Some(self.handle_tool_user_input_request(params)),
+            "mcpServer/elicitation/request" => Some(self.handle_mcp_elicitation_request(params)),
+            _ => None,
+        }
+    }
+
+    fn handle_dynamic_tool_call(&self, params: &Value) -> HandledServerRequest {
+        let tool = params
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let (result, note) = match tool {
+            "load_workspace_dependencies" => {
+                let report = workspace_dependency_report(&self.inner.cwd);
+                (
+                    dynamic_tool_text_response(true, compact_json_pretty(&report)),
+                    None,
+                )
+            }
+            "install_workspace_dependencies" => {
+                let report = workspace_dependency_report(&self.inner.cwd);
+                let text = format!(
+                    "codex-gateway does not provide the desktop thread dependency installer. \
+Return to the caller and use system runtimes directly if possible.\n\nDetected runtime:\n{}",
+                    compact_json_pretty(&report)
+                );
+                (
+                    dynamic_tool_text_response(false, text),
+                    Some(
+                        "install_workspace_dependencies is not available in codex-gateway; returned a structured tool failure instead of stalling the turn."
+                            .to_string(),
+                    ),
+                )
+            }
+            _ => {
+                let text = format!(
+                    "Unsupported tool call in codex-gateway: {tool}. Arguments: {}",
+                    compact_json(&arguments)
+                );
+                (
+                    dynamic_tool_text_response(false, text),
+                    Some(format!(
+                        "Tool {tool} is not implemented by codex-gateway; returned a structured tool failure."
+                    )),
+                )
+            }
+        };
+
+        let success = result
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        HandledServerRequest {
+            result,
+            item_type: Some("tool".to_string()),
+            status: if success {
+                "completed".to_string()
+            } else {
+                "failed".to_string()
+            },
+            text_preview: Some(format!("tool={tool} success={success}")),
+            system_note: note,
+        }
+    }
+
+    fn handle_tool_user_input_request(&self, params: &Value) -> HandledServerRequest {
+        let answers = params
+            .get("questions")
+            .and_then(Value::as_array)
+            .map(|questions| {
+                questions
+                    .iter()
+                    .filter_map(|question| {
+                        question.get("id").and_then(Value::as_str).map(|id| {
+                            (
+                                id.to_string(),
+                                json!({
+                                    "answers": []
+                                }),
+                            )
+                        })
+                    })
+                    .collect::<serde_json::Map<String, Value>>()
+            })
+            .unwrap_or_default();
+
+        HandledServerRequest {
+            result: json!({ "answers": answers }),
+            item_type: Some("toolUserInput".to_string()),
+            status: "auto-empty".to_string(),
+            text_preview: Some("Returned empty answers because gateway has no interactive UI".to_string()),
+            system_note: Some(
+                "A tool requested user input, but codex-gateway has no interactive prompt UI; empty answers were returned."
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn handle_mcp_elicitation_request(&self, params: &Value) -> HandledServerRequest {
+        HandledServerRequest {
+            result: json!({
+                "action": "cancel",
+                "content": Value::Null,
+                "_meta": Value::Null
+            }),
+            item_type: Some("mcpElicitation".to_string()),
+            status: "cancelled".to_string(),
+            text_preview: preview(params.get("message"))
+                .or_else(|| preview(params.get("serverName"))),
+            system_note: Some(
+                "An MCP elicitation request was cancelled because codex-gateway has no form or browser UI."
+                    .to_string(),
+            ),
+        }
     }
 
     fn handle_notification(&self, message: Value) {
@@ -1129,6 +1403,76 @@ fn auto_approval_decision(params: &Value) -> &'static str {
     "accept"
 }
 
+fn dynamic_tool_text_response(success: bool, text: impl Into<String>) -> Value {
+    json!({
+        "success": success,
+        "contentItems": [
+            {
+                "type": "inputText",
+                "text": text.into()
+            }
+        ]
+    })
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn compact_json_pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| compact_json(value))
+}
+
+fn workspace_dependency_report(cwd: &PathBuf) -> Value {
+    let python = resolve_executable("python3").or_else(|| resolve_executable("python"));
+    let python_modules = python
+        .as_ref()
+        .map(|python_bin| {
+            json!({
+                "docx": python_module_available(python_bin, "docx"),
+                "openpyxl": python_module_available(python_bin, "openpyxl"),
+                "pdfplumber": python_module_available(python_bin, "pdfplumber"),
+                "pypdf": python_module_available(python_bin, "pypdf"),
+                "pptx": python_module_available(python_bin, "pptx"),
+            })
+        })
+        .unwrap_or(Value::Null);
+
+    json!({
+        "runtime": "codex-gateway",
+        "cwd": cwd.display().to_string(),
+        "os": env::consts::OS,
+        "arch": env::consts::ARCH,
+        "executables": {
+            "node": resolve_executable("node"),
+            "npm": resolve_executable("npm"),
+            "python": python,
+            "cargo": resolve_executable("cargo"),
+        },
+        "pythonModules": python_modules,
+        "note": "This report is generated by the gateway host runtime, not by the Codex desktop app thread dependency bundle."
+    })
+}
+
+fn resolve_executable(name: &str) -> Option<String> {
+    let paths = env::var_os("PATH")?;
+    env::split_paths(&paths)
+        .map(|path| path.join(name))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.display().to_string())
+}
+
+fn python_module_available(python_bin: &str, module: &str) -> bool {
+    Command::new(python_bin)
+        .arg("-c")
+        .arg(format!("import {module}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn is_response(message: &Value) -> bool {
     message.get("id").is_some() && message.get("method").is_none()
 }
@@ -1190,6 +1534,79 @@ fn extract_user_text(item: &Value) -> String {
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+fn transcript_from_thread(thread: &Value) -> Vec<TranscriptEntry> {
+    let created_at = thread
+        .get("createdAt")
+        .and_then(Value::as_i64)
+        .map(|seconds| seconds.saturating_mul(1000))
+        .unwrap_or_else(unix_millis);
+
+    let mut transcript = Vec::new();
+    let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
+        return transcript;
+    };
+
+    for turn in turns {
+        let turn_status = turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for item in items {
+            let item_type = item.get("type").and_then(Value::as_str);
+            match item_type {
+                Some("userMessage") => {
+                    let text = extract_user_text(item);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    transcript.push(TranscriptEntry {
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        role: "user".to_string(),
+                        text,
+                        status: "completed".to_string(),
+                        source: "thread/read".to_string(),
+                        created_at,
+                    });
+                }
+                Some("agentMessage") => {
+                    let text = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    transcript.push(TranscriptEntry {
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        role: "assistant".to_string(),
+                        text,
+                        status: turn_status.to_string(),
+                        source: "thread/read".to_string(),
+                        created_at,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    trim_transcript(&mut transcript);
+    transcript
 }
 
 fn extract_delta_text(params: &Value) -> String {

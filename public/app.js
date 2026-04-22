@@ -15,11 +15,18 @@ const stopEl = document.querySelector("#stop-turn");
 const newThreadEl = document.querySelector("#new-thread");
 const errorEl = document.querySelector("#error");
 const authTokenEl = document.querySelector("#auth-token");
+const refreshThreadsEl = document.querySelector("#refresh-threads");
+const threadHistoryEl = document.querySelector("#thread-history");
+const threadPreviewEl = document.querySelector("#thread-preview");
+
+const SESSION_STORAGE_KEY = "codexGatewaySessionId";
+const THREAD_STORAGE_KEY = "codexGatewayThreadId";
 
 let state = null;
 let eventSource = null;
 let sessionId = null;
 let authToken = "";
+let threads = [];
 
 function escapeHtml(value) {
   return value
@@ -57,7 +64,9 @@ function renderState(nextState) {
   renderModelOptions();
   renderTranscript();
   renderEvents();
+  renderThreadHistory();
   renderControls();
+  persistCurrentState();
 }
 
 function renderModelOptions() {
@@ -129,6 +138,77 @@ function renderEvents() {
     .join("");
 }
 
+function renderThreadHistory() {
+  if (threads.length === 0) {
+    threadHistoryEl.innerHTML = `<p class="muted">No threads loaded.</p>`;
+    return;
+  }
+
+  threadHistoryEl.innerHTML = threads
+    .map((thread) => {
+      const title = thread.name || thread.preview || thread.id;
+      const updatedAt = thread.updatedAt
+        ? new Date(thread.updatedAt * 1000).toLocaleString()
+        : "unknown time";
+      const active = thread.id === state?.threadId ? " active" : "";
+      return `
+        <div class="thread-row${active}" data-thread-id="${escapeHtml(thread.id)}">
+          <div class="thread-title">${escapeHtml(title)}</div>
+          <div class="thread-meta">${escapeHtml(thread.id)} · ${escapeHtml(updatedAt)}</div>
+          <div class="thread-actions">
+            <button class="ghost" type="button" data-action="preview" data-thread-id="${escapeHtml(thread.id)}">Preview</button>
+            <button type="button" data-action="resume" data-thread-id="${escapeHtml(thread.id)}">Resume</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderThreadPreview(thread) {
+  const turns = thread?.turns ?? [];
+  const messages = [];
+
+  for (const turn of turns) {
+    for (const item of turn.items ?? []) {
+      if (item.type === "userMessage") {
+        const text = userMessageText(item);
+        if (text) {
+          messages.push({ role: "user", text });
+        }
+      }
+      if (item.type === "agentMessage" && item.text) {
+        messages.push({ role: "assistant", text: item.text });
+      }
+    }
+  }
+
+  if (messages.length === 0) {
+    threadPreviewEl.innerHTML = `<p class="muted">No text messages in this thread.</p>`;
+    return;
+  }
+
+  threadPreviewEl.innerHTML = messages
+    .slice(-6)
+    .map(
+      (message) => `
+        <div class="preview-message">
+          <div class="thread-meta">${escapeHtml(message.role)}</div>
+          <div class="thread-title">${escapeHtml(message.text)}</div>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function userMessageText(item) {
+  return (item.content ?? [])
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
 function renderControls() {
   const busy = Boolean(state?.activeTurn);
   const unavailable = !sessionId;
@@ -137,6 +217,7 @@ function renderControls() {
   newThreadEl.disabled = busy || unavailable;
   modelSelectEl.disabled = busy || unavailable;
   promptEl.disabled = !state?.ready || unavailable;
+  refreshThreadsEl.disabled = busy;
 }
 
 function sessionPath(suffix = "") {
@@ -149,6 +230,36 @@ function sessionPath(suffix = "") {
 
 function authHeaders() {
   return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
+
+function persistCurrentState() {
+  if (sessionId) {
+    localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  }
+  if (state?.threadId) {
+    localStorage.setItem(THREAD_STORAGE_KEY, state.threadId);
+  }
+}
+
+function forgetStoredSession() {
+  localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
+function forgetStoredThread() {
+  localStorage.removeItem(THREAD_STORAGE_KEY);
+}
+
+async function getJson(url) {
+  const response = await fetch(url, {
+    headers: authHeaders(),
+  });
+
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "Request failed");
+  }
+
+  return payload;
 }
 
 async function postJson(url, body) {
@@ -169,10 +280,37 @@ async function postJson(url, body) {
   return payload;
 }
 
-async function createSession() {
-  const payload = await postJson("/api/sessions", {});
+async function createSession(body = {}) {
+  const payload = await postJson("/api/sessions", body);
   sessionId = payload.sessionId;
   renderState(payload.state);
+  return payload;
+}
+
+async function restoreOrCreateSession() {
+  const storedSessionId = localStorage.getItem(SESSION_STORAGE_KEY);
+  if (storedSessionId) {
+    sessionId = storedSessionId;
+    try {
+      const payload = await getJson(sessionPath("/state"));
+      renderState(payload.state);
+      return payload;
+    } catch (error) {
+      sessionId = null;
+      forgetStoredSession();
+    }
+  }
+
+  const storedThreadId = localStorage.getItem(THREAD_STORAGE_KEY);
+  if (storedThreadId) {
+    try {
+      return await createSession({ resumeThreadId: storedThreadId });
+    } catch (error) {
+      forgetStoredThread();
+    }
+  }
+
+  return createSession();
 }
 
 function connectEvents() {
@@ -224,6 +362,32 @@ function connectEvents() {
   };
 }
 
+async function loadThreads() {
+  const payload = await getJson("/api/threads?limit=20&sortKey=updated_at");
+  threads = payload.threads ?? [];
+  renderThreadHistory();
+}
+
+async function previewThread(threadId) {
+  const payload = await getJson(`/api/threads/${encodeURIComponent(threadId)}`);
+  renderThreadPreview(payload.thread);
+}
+
+async function resumeThread(threadId) {
+  let payload;
+  if (sessionId) {
+    payload = await postJson(sessionPath("/thread/resume"), { threadId });
+  } else {
+    payload = await createSession({ resumeThreadId: threadId });
+    connectEvents();
+  }
+
+  sessionId = payload.sessionId;
+  renderState(payload.state);
+  await previewThread(threadId);
+  await loadThreads();
+}
+
 formEl.addEventListener("submit", async (event) => {
   event.preventDefault();
   clearError();
@@ -254,6 +418,42 @@ newThreadEl.addEventListener("click", async () => {
   }
 });
 
+refreshThreadsEl.addEventListener("click", async (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  clearError();
+
+  try {
+    await loadThreads();
+  } catch (error) {
+    showError(error.message);
+  }
+});
+
+threadHistoryEl.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) {
+    return;
+  }
+
+  const threadId = button.dataset.threadId;
+  if (!threadId) {
+    return;
+  }
+
+  clearError();
+  try {
+    if (button.dataset.action === "preview") {
+      await previewThread(threadId);
+    }
+    if (button.dataset.action === "resume") {
+      await resumeThread(threadId);
+    }
+  } catch (error) {
+    showError(error.message);
+  }
+});
+
 stopEl.addEventListener("click", async () => {
   clearError();
 
@@ -271,22 +471,10 @@ authTokenEl.addEventListener("change", () => {
   }
 });
 
-window.addEventListener("pagehide", () => {
-  if (!sessionId) {
-    return;
-  }
-
-  eventSource?.close();
-  void fetch(sessionPath(""), {
-    method: "DELETE",
-    headers: authHeaders(),
-    keepalive: true,
-  });
-});
-
 try {
-  await createSession();
+  await restoreOrCreateSession();
   connectEvents();
+  void loadThreads();
 } catch (error) {
   showError(error.message);
   setConnectionState("offline");

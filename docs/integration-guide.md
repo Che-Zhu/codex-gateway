@@ -4,8 +4,8 @@
 
 一个完整接入流程通常是：
 
-1. 调用 `POST /api/sessions` 创建 session
-2. 保存返回的 `sessionId`
+1. 调用 `POST /api/sessions` 创建 session，或传 `resumeThreadId` 恢复历史 thread
+2. 保存返回的 `sessionId` 和 `state.threadId`
 3. 连接 `GET /api/sessions/:id/events` 订阅该 session 的 SSE
 4. 调用 `POST /api/sessions/:id/turn` 发送用户输入
 5. 通过 SSE 或 `GET /api/sessions/:id/state` 获取当前状态和结果
@@ -29,7 +29,8 @@ Content-Type: application/json
 
 ```json
 {
-  "model": "gpt-5.4"
+  "model": "gpt-5.4",
+  "resumeThreadId": "9d7a5c2d-thread"
 }
 ```
 
@@ -55,8 +56,10 @@ Content-Type: application/json
 说明：
 
 - `sessionId` 是后续所有操作的主键
+- `state.threadId` 是 Codex thread 的主键，刷新恢复时应该保存
 - 一个 session 对应一个独立的 `codex app-server` 子进程
 - 如果不传 `model`，会使用服务端默认模型
+- 如果传 `resumeThreadId`，新 session 会恢复该历史 thread
 
 ### 2.2 订阅事件流
 
@@ -73,7 +76,9 @@ Accept: text/event-stream
 
 - 创建 session 后尽快连接 SSE
 - 前端做自动重连
-- 业务侧自己保存 `sessionId`，不要依赖页面刷新后自动恢复
+- 业务侧保存 `sessionId` 和 `threadId`
+- 页面刷新后先尝试复用 `sessionId`
+- 如果 session 已过期，再用 `threadId` 作为 `resumeThreadId` 创建新 session
 
 ### 2.3 发送 prompt
 
@@ -177,7 +182,60 @@ Content-Type: application/json
 - 在保留同一个 session 的前提下，新开一个 thread
 - 适合需要“清空上下文重新开始”，但又不想重建整个 session 的场景
 
-### 2.7 删除 session
+### 2.7 查看和读取历史 thread
+
+列出历史 thread：
+
+```http
+GET /api/threads?limit=20&sortKey=updated_at
+```
+
+读取指定 thread：
+
+```http
+GET /api/threads/:threadId
+```
+
+用途：
+
+- 做历史会话列表
+- 打开历史 thread 预览完整 turns/items
+- 结合 `resumeThreadId` 或 thread resume 接口继续对话
+
+### 2.8 恢复历史 thread
+
+创建新 session 时恢复：
+
+```http
+POST /api/sessions
+Content-Type: application/json
+```
+
+```json
+{
+  "resumeThreadId": "thread-id"
+}
+```
+
+在现有 session 内恢复：
+
+```http
+POST /api/sessions/:id/thread/resume
+Content-Type: application/json
+```
+
+```json
+{
+  "threadId": "thread-id"
+}
+```
+
+说明：
+
+- 当前 session 有 active turn 时不能 resume，会返回 `409`
+- resume 成功后，后续 prompt 会继续写入恢复后的 thread
+
+### 2.9 删除 session
 
 **请求**
 
@@ -188,9 +246,10 @@ DELETE /api/sessions/:id
 用途：
 
 - 主动释放这个 session 对应的 `codex app-server` 子进程
-- 页面退出、任务完成、或会话明确结束时，建议主动调用
+- 任务完成、或会话明确结束时，建议主动调用
+- 普通页面刷新不建议主动删除 session，否则会破坏刷新恢复体验
 
-## 2.8 可选鉴权
+## 2.10 可选鉴权
 
 如果服务端设置了 `CODEX_GATEWAY_JWT_SECRET`，除了 `/healthz` 和 `/readyz` 以外，其他路由都需要携带合法的 HS256 JWT。
 

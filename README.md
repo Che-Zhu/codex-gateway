@@ -29,7 +29,6 @@ Official references used while building this:
 - `rust-src/runtime.rs`: shared runtime helpers for API-key login and `openai_base_url` overrides
 - `rust-src/session_manager.rs`: multi-session lifecycle manager for bridges and TTL cleanup
 - `rust-src/cli.rs`: one-shot CLI smoke test for a single bridge
-- `src/*.mjs`: previous Node implementation retained temporarily as migration reference
 - `public/index.html`: minimal browser UI
 - `public/app.js`: browser behavior that creates its own API session and listens to its own SSE stream
 - `public/styles.css`: intentionally simple UI styling
@@ -75,8 +74,9 @@ That makes the service usable by multiple callers without sharing one thread or 
 ### Important behavior
 
 - `codex app-server` is launched with `sandbox_mode="danger-full-access"` and `approval_policy="never"`
-- command execution and file change approval requests are auto-accepted if they still surface
-- unsupported server-initiated requests are rejected
+- legacy and modern approval requests are auto-accepted when the app-server still surfaces them
+- dynamic tool calls receive a structured tool result; unsupported tools fail explicitly instead of stalling the turn
+- server-initiated requests that still require interactive UI are rejected or cancelled explicitly
 - session state is in memory only
 - gateway auth is optional and is enabled only when `CODEX_GATEWAY_JWT_SECRET` is set
 - one session can only have one active turn at a time
@@ -101,7 +101,7 @@ Then open:
 http://127.0.0.1:1317
 ```
 
-The page creates a fresh session automatically, subscribes to its own SSE stream, and tears the session down on tab close when possible. When JWT auth is enabled, paste a bearer token into the `Auth` panel before using the page.
+The page restores the last live session when possible, falls back to resuming the last thread, and subscribes to its own SSE stream. When JWT auth is enabled, paste a bearer token into the `Auth` panel before using the page.
 
 ### CLI smoke test
 
@@ -243,4 +243,4 @@ If the package is private, authenticate to GHCR before pulling it.
 - no durable session persistence
 - approval UI is intentionally absent because this gateway defaults to full access
 - each live session consumes a `codex app-server` subprocess
-- browser clients reconnect with SSE, but session ownership is not persisted across page reloads unless the caller stores the session id
+- browser clients can recover from reloads by storing the session id and thread id, but gateway sessions themselves are still in-memory only

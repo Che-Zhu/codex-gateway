@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_stream::stream;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::response::IntoResponse;
@@ -15,7 +15,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tracing::error;
 
@@ -32,8 +32,10 @@ struct AppState {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CreateSessionRequest {
     model: Option<String>,
+    resume_thread_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,6 +46,23 @@ struct TurnRequest {
 #[derive(Debug, Default, Deserialize)]
 struct ThreadRequest {
     model: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadResumeRequest {
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadListQuery {
+    cursor: Option<String>,
+    limit: Option<u64>,
+    sort_key: Option<String>,
+    archived: Option<bool>,
+    cwd: Option<String>,
+    search_term: Option<String>,
 }
 
 #[tokio::main]
@@ -103,6 +122,8 @@ fn build_router(state: AppState) -> Router {
             get(legacy_single_session_gone).post(legacy_single_session_gone),
         )
         .route("/api/sessions", post(create_session))
+        .route("/api/threads", get(get_threads))
+        .route("/api/threads/{thread_id}", get(get_thread))
         .route("/api/sessions/{id}/state", get(get_session_state))
         .route("/api/sessions/{id}/events", get(get_session_events))
         .route("/api/sessions/{id}/turn", post(post_turn))
@@ -110,6 +131,7 @@ fn build_router(state: AppState) -> Router {
             "/api/sessions/{id}/turn/interrupt",
             post(post_interrupt_turn),
         )
+        .route("/api/sessions/{id}/thread/resume", post(post_resume_thread))
         .route("/api/sessions/{id}/thread/new", post(post_new_thread))
         .route("/api/sessions/{id}", delete(delete_session))
         .route_layer(middleware::from_fn_with_state(
@@ -176,13 +198,49 @@ async fn create_session(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let request: CreateSessionRequest = parse_json_body(body)?;
     let model = trim_optional(request.model);
-    let (session_id, session, snapshot) = state.session_manager.create_session(model).await?;
+    let resume_thread_id = trim_optional(request.resume_thread_id);
+    let (session_id, session, snapshot) = state
+        .session_manager
+        .create_session(model, resume_thread_id)
+        .await?;
 
     Ok(Json(json!({
         "ok": true,
         "sessionId": session_id,
         "session": session,
         "state": snapshot,
+    })))
+}
+
+async fn get_threads(
+    State(state): State<AppState>,
+    Query(query): Query<ThreadListQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = state
+        .session_manager
+        .list_threads(thread_list_params(query))
+        .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "threads": result.get("data").cloned().unwrap_or_else(|| json!([])),
+        "nextCursor": result.get("nextCursor").cloned().unwrap_or(Value::Null),
+        "raw": result,
+    })))
+}
+
+async fn get_thread(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = state.session_manager.read_thread(&thread_id).await?;
+    let thread = result.get("thread").cloned().unwrap_or_else(|| json!({}));
+
+    Ok(Json(json!({
+        "ok": true,
+        "threadId": thread_id,
+        "thread": thread,
+        "raw": result,
     })))
 }
 
@@ -282,6 +340,25 @@ async fn post_new_thread(
     })))
 }
 
+async fn post_resume_thread(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let request: ThreadResumeRequest = parse_json_body(body)?;
+    let thread_id = trim_optional(request.thread_id)
+        .ok_or_else(|| AppError::bad_request("threadId must not be empty"))?;
+    let snapshot = state.session_manager.resume_thread(&id, &thread_id).await?;
+    let session = state.session_manager.get_session_info(&id)?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "sessionId": id,
+        "session": session,
+        "state": snapshot,
+    })))
+}
+
 async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -322,6 +399,31 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn thread_list_params(query: ThreadListQuery) -> Value {
+    let mut params = Map::new();
+
+    if let Some(cursor) = trim_optional(query.cursor) {
+        params.insert("cursor".to_string(), json!(cursor));
+    }
+    if let Some(limit) = query.limit {
+        params.insert("limit".to_string(), json!(limit));
+    }
+    if let Some(sort_key) = trim_optional(query.sort_key) {
+        params.insert("sortKey".to_string(), json!(sort_key));
+    }
+    if let Some(archived) = query.archived {
+        params.insert("archived".to_string(), json!(archived));
+    }
+    if let Some(cwd) = trim_optional(query.cwd) {
+        params.insert("cwd".to_string(), json!(cwd));
+    }
+    if let Some(search_term) = trim_optional(query.search_term) {
+        params.insert("searchTerm".to_string(), json!(search_term));
+    }
+
+    Value::Object(params)
 }
 
 fn bridge_event_to_sse(event: BridgeEvent) -> Event {

@@ -109,11 +109,12 @@ Response:
 
 每个 session 会启动一个独立的 `codex app-server` 子进程。
 
-Request body 可以为空，也可以传模型：
+Request body 可以为空，也可以传模型，或恢复一个已有 thread：
 
 ```json
 {
-  "model": "gpt-5.4"
+  "model": "gpt-5.4",
+  "resumeThreadId": "thread-id"
 }
 ```
 
@@ -136,7 +137,57 @@ Response:
 常见错误：
 
 - `503`：达到最大并发 session 数。
-- `500`：启动或初始化 `codex app-server` 失败。
+- `500`：启动、初始化 `codex app-server` 或恢复 thread 失败。
+
+### GET /api/threads
+
+列出 app-server 可见的历史 thread。
+
+Query 参数：
+
+- `cursor`：分页 cursor。
+- `limit`：返回数量。
+- `sortKey`：排序字段，例如 `created_at` 或 `updated_at`。
+- `archived`：是否查询归档 thread。
+- `cwd`：按工作目录精确过滤。
+- `searchTerm`：按标题/预览文本过滤。
+
+Response:
+
+```json
+{
+  "ok": true,
+  "threads": [],
+  "nextCursor": null,
+  "raw": {}
+}
+```
+
+说明：
+
+- 这个接口内部调用 `thread/list`。
+- 如果当前已有 live session，会复用一个 live session 的 app-server bridge。
+- 如果当前没有 live session，会临时启动一个 app-server bridge 查询，查询后关闭。
+
+### GET /api/threads/:threadId
+
+读取指定 thread 的完整历史。
+
+Response:
+
+```json
+{
+  "ok": true,
+  "threadId": "thread-id",
+  "thread": {},
+  "raw": {}
+}
+```
+
+说明：
+
+- 这个接口内部调用 `thread/read`，并设置 `includeTurns=true`。
+- `thread.turns[].items[]` 包含历史消息、工具调用等 app-server 原始 thread item。
 
 ### GET /api/sessions/:id/state
 
@@ -178,7 +229,7 @@ data: {...}
 | `session` | 当前 session metadata。连接建立时发送。 |
 | `state` | 当前 bridge 状态快照。状态变化时发送。 |
 | `notification` | `codex app-server` 发来的普通通知。 |
-| `server-request` | `codex app-server` 发起的请求，例如 approval request。当前命令执行和文件修改 approval request 会被自动接受。 |
+| `server-request` | `codex app-server` 发起的请求，例如 approval request、dynamic tool call、tool user input。gateway 会自动接受可自动处理的 approval，给 tool call 返回结构化结果，并对无法交互完成的请求显式取消或拒绝。 |
 | `warning` | gateway 或 bridge 产生的警告。 |
 | `raw` | 原始 app-server 消息。仅在 `CODEX_GATEWAY_DEBUG=1` 时可能出现。 |
 | `session-closed` | session 被关闭、过期或 gateway shutdown。 |
@@ -295,6 +346,43 @@ Response:
 
 - `404`：session 不存在或已过期。
 - `500`：`thread/start` 失败。
+
+### POST /api/sessions/:id/thread/resume
+
+在同一个 gateway session 内恢复一个历史 thread。
+
+Request body:
+
+```json
+{
+  "threadId": "thread-id"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "sessionId": "session-id",
+  "session": {},
+  "state": {}
+}
+```
+
+说明：
+
+- session 保留。
+- `codex app-server` 子进程保留。
+- 当前 thread 切换为请求里的历史 thread。
+- 后续 `POST /api/sessions/:id/turn` 会继续写入恢复后的 thread。
+
+常见错误：
+
+- `400`：`threadId` 为空或请求体不是合法 JSON。
+- `404`：session 不存在或已过期。
+- `409`：当前 session 已经有 active turn。
+- `500`：`thread/resume` 失败。
 
 ### DELETE /api/sessions/:id
 
