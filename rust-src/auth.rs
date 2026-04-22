@@ -6,6 +6,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::config::AuthConfig;
 use crate::error::AppError;
@@ -44,12 +45,20 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
+    let path = req.uri().path().to_string();
+
     let token = bearer_token(req.headers().get(header::AUTHORIZATION))
         .or(query.access_token)
         .or(query.token)
-        .ok_or_else(|| AppError::unauthorized("Missing bearer token"))?;
+        .ok_or_else(|| {
+            warn!(path = %path, "missing bearer token");
+            AppError::unauthorized("Missing bearer token")
+        })?;
 
-    validate_jwt(state.auth.as_ref().expect("auth enabled"), &token)?;
+    if let Err(error) = validate_jwt(state.auth.as_ref().expect("auth enabled"), &token) {
+        warn!(path = %path, error = %error, "invalid bearer token");
+        return Err(error);
+    }
     Ok(next.run(req).await)
 }
 

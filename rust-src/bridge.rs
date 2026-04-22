@@ -6,11 +6,12 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ClientInfo;
 use crate::env_config::apply_codex_child_env;
@@ -117,6 +118,12 @@ impl CodexAppServerBridge {
             return Ok(self.get_state());
         }
 
+        info!(
+            cwd = %self.inner.cwd.display(),
+            codex_bin = %self.inner.codex_bin,
+            start_thread,
+            "starting app-server bridge"
+        );
         self.spawn_child()?;
 
         self.with_state(|state| {
@@ -167,6 +174,10 @@ impl CodexAppServerBridge {
         });
         self.inner.started.store(true, Ordering::SeqCst);
         self.emit_state();
+        info!(
+            thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+            "app-server bridge ready"
+        );
         Ok(self.get_state())
     }
 
@@ -187,6 +198,12 @@ impl CodexAppServerBridge {
             };
         });
         self.emit_state();
+        let state = self.get_state();
+        info!(
+            account_summary = %state.account.summary,
+            requires_openai_auth = state.account.requires_openai_auth.unwrap_or(false),
+            "refreshed account snapshot"
+        );
         Ok(())
     }
 
@@ -265,6 +282,12 @@ impl CodexAppServerBridge {
             state.selected_model = selected_model;
         });
         self.emit_state();
+        let state = self.get_state();
+        info!(
+            model_count = state.models.len(),
+            selected_model = state.selected_model.as_deref().unwrap_or("-"),
+            "refreshed model catalog"
+        );
         Ok(())
     }
 
@@ -309,6 +332,11 @@ impl CodexAppServerBridge {
             text_preview: Some(format!("Started thread {thread_id}")),
         });
         self.emit_state();
+        info!(
+            thread_id = %thread_id,
+            model = %selected_model,
+            "started new thread"
+        );
         Ok(thread_id)
     }
 
@@ -392,6 +420,12 @@ impl CodexAppServerBridge {
             text_preview: Some(format!("Resumed thread {resumed_thread_id}")),
         });
         self.emit_state();
+        info!(
+            thread_id = %resumed_thread_id,
+            model = self.get_state().selected_model.as_deref().unwrap_or("-"),
+            active_turn,
+            "resumed thread"
+        );
 
         Ok(result)
     }
@@ -424,6 +458,11 @@ impl CodexAppServerBridge {
             state.last_turn_status = Some("inProgress".to_string());
         });
         self.emit_state();
+        info!(
+            thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+            prompt_len = prompt.chars().count(),
+            "sending turn/start to app-server"
+        );
 
         let thread_id = self
             .get_state()
@@ -467,6 +506,12 @@ impl CodexAppServerBridge {
                     }
                 });
                 self.emit_state();
+                info!(
+                    thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+                    turn_id = self.get_state().current_turn_id.as_deref().unwrap_or("-"),
+                    status = self.get_state().last_turn_status.as_deref().unwrap_or("-"),
+                    "turn/start accepted"
+                );
                 Ok(result)
             }
             Err(error) => {
@@ -476,6 +521,7 @@ impl CodexAppServerBridge {
                     state.last_turn_status = Some("failed".to_string());
                 });
                 self.emit_state();
+                error!(error = %error, "turn/start failed");
                 Err(error)
             }
         }
@@ -517,11 +563,16 @@ impl CodexAppServerBridge {
             event_type: "local".to_string(),
             method: Some("turn/interrupt".to_string()),
             item_type: None,
-            item_id: Some(requested_turn_id),
+            item_id: Some(requested_turn_id.clone()),
             status: Some("accepted".to_string()),
             text_preview: Some("Interrupt requested".to_string()),
         });
         self.emit_state();
+        info!(
+            thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+            turn_id = %requested_turn_id,
+            "turn interrupt requested"
+        );
 
         Ok(result)
     }
@@ -591,6 +642,12 @@ impl CodexAppServerBridge {
             return Ok(());
         }
 
+        info!(
+            cwd = %self.inner.cwd.display(),
+            codex_bin = %self.inner.codex_bin,
+            "stopping app-server bridge"
+        );
+
         self.fail_pending(format!(
             "{} app-server process is not available",
             self.inner.codex_bin
@@ -609,6 +666,7 @@ impl CodexAppServerBridge {
     async fn request(&self, method: &str, params: Value) -> Result<Value, AppError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
+        let started_at = Instant::now();
 
         self.inner.pending.lock().unwrap().insert(
             id,
@@ -624,16 +682,56 @@ impl CodexAppServerBridge {
             "params": params
         })) {
             self.inner.pending.lock().unwrap().remove(&id);
+            error!(
+                rpc_id = id,
+                app_server_method = %method,
+                error = %error,
+                "failed to send app-server request"
+            );
             return Err(error);
         }
 
         match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(AppError::ChannelClosed),
+            Ok(result) => match result {
+                Ok(value) => {
+                    info!(
+                        rpc_id = id,
+                        app_server_method = %method,
+                        duration_ms = started_at.elapsed().as_millis() as u64,
+                        "app-server request completed"
+                    );
+                    Ok(value)
+                }
+                Err(error) => {
+                    error!(
+                        rpc_id = id,
+                        app_server_method = %method,
+                        duration_ms = started_at.elapsed().as_millis() as u64,
+                        error = %error,
+                        "app-server request failed"
+                    );
+                    Err(error)
+                }
+            },
+            Err(_) => {
+                error!(
+                    rpc_id = id,
+                    app_server_method = %method,
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    "app-server request channel closed"
+                );
+                Err(AppError::ChannelClosed)
+            }
         }
     }
 
     fn spawn_child(&self) -> Result<(), AppError> {
+        info!(
+            codex_bin = %self.inner.codex_bin,
+            cwd = %self.inner.cwd.display(),
+            debug = self.inner.debug,
+            "spawning codex app-server child"
+        );
         let mut child = Command::new(&self.inner.codex_bin);
         child
             .arg("app-server")
@@ -666,6 +764,7 @@ impl CodexAppServerBridge {
 
         self.spawn_stdout_thread(stdout);
         self.spawn_wait_thread();
+        info!("codex app-server child spawned");
 
         Ok(())
     }
@@ -751,6 +850,7 @@ impl CodexAppServerBridge {
         };
 
         if self.inner.debug {
+            debug!(payload = %line, "received raw app-server message");
             let _ = self.inner.events.send(BridgeEvent::Raw(line.clone()));
         }
 
@@ -1088,11 +1188,20 @@ Return to the caller and use system runtimes directly if possible.\n\nDetected r
                         state.thread_id = Some(thread_id);
                     }
                 });
+                info!(
+                    thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+                    "received thread/started notification"
+                );
             }
             "thread/status/changed" => {
                 self.with_state(|state| {
                     state.thread_status = params.get("status").cloned();
                 });
+                info!(
+                    thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+                    status = %compact_json(&params.get("status").cloned().unwrap_or_else(|| json!({}))),
+                    "received thread/status/changed notification"
+                );
             }
             "turn/started" => {
                 let turn_id = params
@@ -1105,6 +1214,11 @@ Return to the caller and use system runtimes directly if possible.\n\nDetected r
                     state.active_turn = true;
                     state.last_turn_status = Some("inProgress".to_string());
                 });
+                info!(
+                    thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+                    turn_id = self.get_state().current_turn_id.as_deref().unwrap_or("-"),
+                    "received turn/started notification"
+                );
             }
             "turn/completed" => {
                 let status = params
@@ -1117,6 +1231,11 @@ Return to the caller and use system runtimes directly if possible.\n\nDetected r
                     state.active_turn = false;
                     state.last_turn_status = status;
                 });
+                info!(
+                    thread_id = self.get_state().thread_id.as_deref().unwrap_or("-"),
+                    status = self.get_state().last_turn_status.as_deref().unwrap_or("-"),
+                    "received turn/completed notification"
+                );
             }
             "item/started" => self.handle_started_item(&item),
             "item/agentMessage/delta" => self.handle_agent_message_delta(&params),
@@ -1127,6 +1246,7 @@ Return to the caller and use system runtimes directly if possible.\n\nDetected r
                     .and_then(|error| error.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("Unknown app-server error");
+                warn!(error_message = %message, "received app-server error notification");
                 self.push_system_note(message.to_string());
             }
             _ => {}
@@ -1242,6 +1362,12 @@ Return to the caller and use system runtimes directly if possible.\n\nDetected r
     }
 
     fn emit_warning(&self, warning: WarningEvent) {
+        warn!(
+            warning_type = %warning.warning_type,
+            detail = warning.detail.as_deref().unwrap_or("-"),
+            message = %warning.message,
+            "bridge warning"
+        );
         self.record_summary_event(SummaryEvent {
             at: Utc::now().to_rfc3339(),
             event_type: "warning".to_string(),
